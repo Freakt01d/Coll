@@ -372,6 +372,33 @@ def rebuild_indexes(table_name, indexes=None):
     except Exception as e:
         print(f"  Error: {e}")
 
+def ensure_indexes_usable(table_name):
+    """Ensure all indexes are usable before loading (fix from previous failed runs)"""
+    try:
+        connection = oracledb.connect(dest_connection_string)
+        cursor = connection.cursor()
+        
+        # Find unusable indexes
+        cursor.execute("""
+            SELECT index_name FROM all_indexes 
+            WHERE table_name = :1 AND owner = :2 AND status = 'UNUSABLE'
+        """, [table_name.upper(), SCHEMA.upper()])
+        unusable = cursor.fetchall()
+        
+        if unusable:
+            print(f"\n  Found {len(unusable)} UNUSABLE indexes - rebuilding...")
+            for (idx_name,) in unusable:
+                try:
+                    cursor.execute(f"ALTER INDEX {SCHEMA}.{idx_name} REBUILD")
+                    print(f"    Rebuilt: {idx_name}")
+                except Exception as e:
+                    print(f"    Warning: {idx_name}: {e}")
+        
+        cursor.close()
+        connection.close()
+    except Exception as e:
+        print(f"  Error checking indexes: {e}")
+
 def process_csv_file(csv_file, table_name, truncate_first=False, is_first_file=True):
     """Process a single CSV file with parallel SQL*Loader"""
     file_name = os.path.basename(csv_file)
@@ -511,6 +538,9 @@ def main():
         return
     
     print(f"\nAll CSV files will be loaded into: {SCHEMA}.{table_name}")
+    
+    # Ensure all indexes are usable (fix from previous failed runs)
+    ensure_indexes_usable(table_name)
     
     print(f"\nTotal size: {total_size:.2f} GB")
     
