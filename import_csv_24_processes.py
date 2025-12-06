@@ -1,3 +1,5 @@
+        cursor.execute("ALTER SESSION DISABLE PARALLEL DML")
+        cursor.execute("ALTER SESSION DISABLE PARALLEL QUERY")
 import oracledb
 import os
 import csv
