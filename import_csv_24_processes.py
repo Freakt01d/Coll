@@ -357,11 +357,10 @@ def rebuild_indexes(table_name, indexes=None):
     except Exception as e:
         print(f"  Error: {e}")
 
-def process_csv_file(csv_file, truncate_first=False, is_first_file=True):
+def process_csv_file(csv_file, table_name, truncate_first=False, is_first_file=True):
     """Process a single CSV file with parallel SQL*Loader"""
     file_name = os.path.basename(csv_file)
     file_size = os.path.getsize(csv_file) / (1024 * 1024 * 1024)  # GB
-    table_name = get_table_name(csv_file)
     
     print(f"\n{'='*80}")
     print(f"Processing: {file_name} ({file_size:.2f} GB)")
@@ -471,9 +470,13 @@ def main():
         print(f"ERROR: Directory '{csv_dir}' does not exist!")
         return
     
-    # Find CSV files
-    csv_files = sorted(glob.glob(os.path.join(csv_dir, "*.csv")) + 
-                       glob.glob(os.path.join(csv_dir, "*.CSV")))
+    # Find CSV files (use set to avoid duplicates on case-insensitive systems)
+    csv_files = set(glob.glob(os.path.join(csv_dir, "*.csv")) + 
+                    glob.glob(os.path.join(csv_dir, "*.CSV")))
+    
+    # Exclude chunk files from previous runs (contain "_chunk" in name)
+    csv_files = [f for f in csv_files if '_chunk' not in os.path.basename(f).lower()]
+    csv_files = sorted(csv_files)
     
     if not csv_files:
         print("No CSV files found!")
@@ -484,8 +487,15 @@ def main():
     for f in csv_files:
         size_gb = os.path.getsize(f) / (1024 * 1024 * 1024)
         total_size += size_gb
-        table = get_table_name(f)
-        print(f"  - {os.path.basename(f)} -> {table} ({size_gb:.2f} GB)")
+        print(f"  - {os.path.basename(f)} ({size_gb:.2f} GB)")
+    
+    # Ask for table name
+    table_name = input("\nEnter destination table name: ").strip().upper()
+    if not table_name:
+        print("ERROR: Table name is required!")
+        return
+    
+    print(f"\nAll CSV files will be loaded into: {SCHEMA}.{table_name}")
     
     print(f"\nTotal size: {total_size:.2f} GB")
     
@@ -496,29 +506,26 @@ def main():
     print("STARTING IMPORT")
     print("="*80)
     
-    # Track which tables have been processed and their disabled indexes
-    processed_tables = set()
-    table_indexes = {}  # table_name -> list of disabled indexes
+    # Track disabled indexes
+    disabled_indexes = []
     
     total_files = 0
     total_rows = 0
     failed_files = []
     start_time = datetime.now()
     
-    for csv_file in csv_files:
-        table_name = get_table_name(csv_file)
-        is_first = table_name not in processed_tables
+    for i, csv_file in enumerate(csv_files):
+        is_first = (i == 0)  # Only first file triggers truncate/index disable
         
         success, rows, tbl_name, disabled_idx = process_csv_file(
-            csv_file, 
+            csv_file,
+            table_name,
             truncate_first=(truncate == 'y'),
             is_first_file=is_first
         )
         
-        if is_first:
-            processed_tables.add(table_name)
-            if disabled_idx:
-                table_indexes[table_name] = disabled_idx
+        if is_first and disabled_idx:
+            disabled_indexes = disabled_idx
         
         if success:
             total_files += 1
@@ -528,14 +535,12 @@ def main():
     
     load_elapsed = (datetime.now() - start_time).total_seconds()
     
-    # Rebuild indexes for all tables
-    if DIRECT_PATH and table_indexes:
+    # Rebuild indexes
+    if DIRECT_PATH and disabled_indexes:
         print("\n" + "="*80)
         print("REBUILDING INDEXES")
         print("="*80)
-        
-        for table_name, indexes in table_indexes.items():
-            rebuild_indexes(table_name, indexes)
+        rebuild_indexes(table_name, disabled_indexes)
     
     elapsed = (datetime.now() - start_time).total_seconds()
     
