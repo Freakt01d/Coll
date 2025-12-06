@@ -112,6 +112,25 @@ def split_csv_file(csv_file, num_chunks, output_dir):
     print(f"  Split into {len(chunk_files)} chunks")
     return chunk_files, header
 
+def get_table_columns(table_name):
+    """Get column names from database table"""
+    try:
+        connection = oracledb.connect(dest_connection_string)
+        cursor = connection.cursor()
+        cursor.execute("""
+            SELECT column_name, data_type
+            FROM all_tab_columns 
+            WHERE table_name = :1 AND owner = :2
+            ORDER BY column_id
+        """, [table_name.upper(), SCHEMA.upper()])
+        columns = cursor.fetchall()
+        cursor.close()
+        connection.close()
+        return columns  # List of (column_name, data_type)
+    except Exception as e:
+        print(f"  Error getting columns: {e}")
+        return []
+
 # Date/Timestamp column patterns - add your date columns here
 DATE_COLUMNS = {
     'REF_DATE': 'DATE "YYYY-MM-DD HH24:MI:SS"',
@@ -130,19 +149,36 @@ def create_control_file(table_name, csv_file, columns, output_dir):
     base = os.path.splitext(os.path.basename(csv_file))[0]
     ctl_file = os.path.join(output_dir, f"{base}.ctl")
     
+    # Get columns from database with data types
+    db_columns = get_table_columns(table_name)
+    db_col_types = {col[0]: col[1] for col in db_columns} if db_columns else {}
+    
+    # If no columns from CSV header, use database columns
+    if not columns and db_columns:
+        print(f"    No header in CSV, using {len(db_columns)} columns from database")
+        columns = [col[0] for col in db_columns]
+    
     # Build column specification with date format handling
     col_specs = []
     if columns:
         for col in columns:
             col_name = col.strip().strip('"').strip("'").upper()
-            # Check if this is a date/timestamp column
-            if col_name in DATE_COLUMNS:
+            data_type = db_col_types.get(col_name, '')
+            
+            # Check data type from database
+            if 'TIMESTAMP' in data_type:
+                col_specs.append(f'{col_name} TIMESTAMP "YYYY-MM-DD HH24:MI:SS.FF6"')
+            elif data_type == 'DATE':
+                col_specs.append(f'{col_name} DATE "YYYY-MM-DD HH24:MI:SS"')
+            elif col_name in DATE_COLUMNS:
+                # Fallback to hardcoded list
                 col_specs.append(f"{col_name} {DATE_COLUMNS[col_name]}")
             else:
                 col_specs.append(col_name)
         col_spec = ',\n    '.join(col_specs)
     else:
-        col_spec = "-- Auto-detect columns"
+        print(f"    WARNING: No columns found for {table_name}!")
+        col_spec = "FILLER"  # Fallback - will likely fail but won't crash
     
     control_content = f"""LOAD DATA
 INFILE '{csv_file}'
