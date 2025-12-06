@@ -21,11 +21,14 @@ DB_SID = "placeholder"
 # SQL*Loader connection string
 DB_CONNECT = f"{DB_USER}/{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_SID}"
 
-# Performance settings
-PARALLEL_CHUNKS = 16          # Split each CSV into this many chunks
-ROWS_PER_COMMIT = 100000      # Commit every N rows
+# Performance settings (Optimized for 256GB RAM, Xeon Platinum, 10Gbps)
+# Each file ~200MB, ~1.14M rows - load entire file in memory
+PARALLEL_FILES = 32           # Load 32 files at once (32 x 200MB = 6.4GB, fits easily in 256GB)
+ROWS_PER_COMMIT = 2000000     # Load entire file in one commit (no intermediate commits)
 DIRECT_PATH = True            # Fast direct path - indexes handled separately
 USE_STAGING_TABLES = True     # Use staging tables for lock-free parallel loading
+SQLLDR_BINDSIZE = 268435456   # 256MB bind buffer (entire file fits)
+SQLLDR_READSIZE = 268435456   # 256MB read buffer
 
 # Table configuration - maps CSV filename pattern to table name
 # If CSV filename is "EDS_COMP_001.csv", it will use table EDS_COMP
@@ -38,14 +41,6 @@ def get_table_name(csv_file):
     name = re.sub(r'_\d+$', '', name)
     return name
 
-def count_lines(filepath):
-    """Count lines in a file efficiently"""
-    count = 0
-    with open(filepath, 'rb') as f:
-        for _ in f:
-            count += 1
-    return count
-
 def get_csv_header(csv_file):
     """Get header row from CSV"""
     with open(csv_file, 'r', encoding='utf-8') as f:
@@ -55,64 +50,6 @@ def get_csv_header(csv_file):
         if parts and not parts[0].replace('.','').replace('-','').isdigit():
             return parts
     return None
-
-def split_csv_file(csv_file, num_chunks, output_dir):
-    """Split CSV file into chunks, preserving header"""
-    print(f"  Splitting into {num_chunks} chunks...")
-    
-    # Count total lines
-    total_lines = count_lines(csv_file)
-    
-    # Check for header
-    header = None
-    with open(csv_file, 'r', encoding='utf-8') as f:
-        first_line = f.readline()
-        parts = first_line.strip().split(',')
-        # Simple heuristic: if first field isn't a number, it's a header
-        if parts and not parts[0].replace('.','').replace('-','').replace(' ','').isdigit():
-            header = first_line
-            total_lines -= 1  # Don't count header
-    
-    if total_lines == 0:
-        print("  ERROR: Empty file!")
-        return []
-    
-    lines_per_chunk = (total_lines + num_chunks - 1) // num_chunks
-    
-    base_name = os.path.splitext(os.path.basename(csv_file))[0]
-    chunk_files = []
-    
-    with open(csv_file, 'r', encoding='utf-8', buffering=16*1024*1024) as infile:
-        # Skip header if present
-        if header:
-            next(infile)
-        
-        chunk_num = 0
-        current_lines = 0
-        current_file = None
-        
-        for line in infile:
-            if current_file is None:
-                chunk_path = os.path.join(output_dir, f"{base_name}_chunk{chunk_num:02d}.csv")
-                current_file = open(chunk_path, 'w', encoding='utf-8', buffering=16*1024*1024)
-                chunk_files.append(chunk_path)
-            
-            current_file.write(line)
-            current_lines += 1
-            
-            if current_lines >= lines_per_chunk:
-                current_file.close()
-                print(f"    Chunk {chunk_num}: {current_lines:,} lines")
-                current_file = None
-                current_lines = 0
-                chunk_num += 1
-        
-        if current_file:
-            current_file.close()
-            print(f"    Chunk {chunk_num}: {current_lines:,} lines")
-    
-    print(f"  Split into {len(chunk_files)} chunks")
-    return chunk_files, header
 
 def get_table_columns(table_name):
     """Get column names from database table"""
@@ -200,35 +137,59 @@ TRAILING NULLCOLS
     
     return ctl_file
 
-def run_sqlldr_chunk(args):
-    """Run SQL*Loader for a single chunk"""
-    chunk_file, ctl_file, table_name, chunk_id, output_dir = args
+def load_single_file(args):
+    """Load a single CSV file using SQL*Loader with staging table"""
+    csv_file, file_idx, table_name, temp_dir = args
     
-    # No stagger needed with staging tables - each loads to its own table
+    file_name = os.path.basename(csv_file)
+    staging_table = None
     
-    base = os.path.splitext(os.path.basename(chunk_file))[0]
-    log_file = os.path.join(output_dir, f"{base}.log")
-    
-    cmd = [
-        'sqlldr',
-        f'userid={DB_CONNECT}',
-        f'control={ctl_file}',
-        f'log={log_file}',
-        f'rows={ROWS_PER_COMMIT}',
-        'errors=100000',
-        'direct_path_lock_wait=true',  # Wait for lock instead of failing (Oracle 12.2+)
-        'bindsize=20000000',
-        'readsize=20000000',
-        'silent=(header,feedback)',
-    ]
-    
-    if DIRECT_PATH:
-        cmd.append('direct=true')
-    
-    start_time = datetime.now()
+    # Clear memory before starting
+    gc.collect()
     
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=14400)  # 4 hour timeout
+        # Create staging table for this file
+        if USE_STAGING_TABLES:
+            staging_table = create_staging_table(table_name, file_idx)
+            if not staging_table:
+                print(f"  [{file_idx:03d}] ERROR: Could not create staging table")
+                return file_idx, False, 0, csv_file, None
+            target_table = staging_table
+        else:
+            target_table = table_name
+        
+        # Get CSV header
+        header_parts = get_csv_header(csv_file)
+        
+        # Create control file
+        ctl_file = create_control_file(target_table, csv_file, header_parts, temp_dir)
+        
+        # Build sqlldr command
+        log_file = os.path.join(temp_dir, f"{os.path.splitext(file_name)[0]}.log")
+        
+        cmd = [
+            'sqlldr',
+            f'userid={DB_CONNECT}',
+            f'control={ctl_file}',
+            f'log={log_file}',
+            f'rows={ROWS_PER_COMMIT}',
+            'errors=100000',
+            'direct_path_lock_wait=true',
+            f'bindsize={SQLLDR_BINDSIZE}',
+            f'readsize={SQLLDR_READSIZE}',
+            'streamsize=16777216',      # 16MB stream buffer
+            'multithreading=true',      # Enable multi-threading
+            'columnarrayrows=100000',   # Large column array for speed
+            'silent=(header,feedback)',
+        ]
+        
+        if DIRECT_PATH:
+            cmd.append('direct=true')
+        
+        print(f"  [{file_idx:03d}] Loading: {file_name} -> {target_table}")
+        start_time = datetime.now()
+        
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=14400)
         elapsed = (datetime.now() - start_time).total_seconds()
         
         # Parse log file for row count
@@ -241,22 +202,29 @@ def run_sqlldr_chunk(args):
                 if match:
                     rows_loaded = int(match.group(1))
         
-        success = result.returncode in (0, 2)  # 0=success, 2=warnings
+        success = result.returncode in (0, 2)
         
         if success:
             speed = rows_loaded / elapsed if elapsed > 0 else 0
-            print(f"    [Chunk {chunk_id}] {rows_loaded:,} rows in {elapsed:.1f}s ({speed:,.0f}/s)")
+            print(f"  [{file_idx:03d}] Done: {file_name} - {rows_loaded:,} rows in {elapsed:.1f}s ({speed:,.0f}/s)")
         else:
-            print(f"    [Chunk {chunk_id}] FAILED - check {log_file}")
+            print(f"  [{file_idx:03d}] FAILED: {file_name} - check {log_file}")
         
-        return chunk_id, success, rows_loaded, elapsed
+        # Clear memory after processing
+        gc.collect()
+        
+        return file_idx, success, rows_loaded, csv_file, staging_table
         
     except subprocess.TimeoutExpired:
-        print(f"    [Chunk {chunk_id}] TIMEOUT")
-        return chunk_id, False, 0, 0
+        print(f"  [{file_idx:03d}] TIMEOUT: {file_name}")
+        gc.collect()
+        return file_idx, False, 0, csv_file, staging_table
     except Exception as e:
-        print(f"    [Chunk {chunk_id}] ERROR: {e}")
-        return chunk_id, False, 0, 0
+        print(f"  [{file_idx:03d}] ERROR: {file_name} - {e}")
+        import traceback
+        traceback.print_exc()
+        gc.collect()
+        return file_idx, False, 0, csv_file, staging_table
 
 # Create connection string for oracledb
 dest_dsn = oracledb.makedsn(DB_HOST, DB_PORT, sid=DB_SID)
@@ -405,40 +373,45 @@ def create_staging_table(table_name, chunk_id):
         return None
 
 def merge_staging_tables(table_name, staging_tables):
-    """Merge all staging tables into the main table"""
+    """Merge all staging tables into the main table using parallel INSERT"""
     print(f"\n  Merging {len(staging_tables)} staging tables into {table_name}...")
     
-    total_rows = 0
+    merge_count = 0
     try:
         connection = oracledb.connect(dest_connection_string)
         cursor = connection.cursor()
         
+        # Enable parallel DML for faster merge
+        cursor.execute("ALTER SESSION ENABLE PARALLEL DML")
+        
         for stg_table in staging_tables:
             try:
-                # Get row count
-                cursor.execute(f"SELECT COUNT(*) FROM {SCHEMA}.{stg_table}")
-                count = cursor.fetchone()[0]
-                
-                # Insert with APPEND hint for direct path
+                # Fast INSERT without counting first (COUNT is slow on large tables)
                 cursor.execute(f"""
-                    INSERT /*+ APPEND */ INTO {SCHEMA}.{table_name}
-                    SELECT * FROM {SCHEMA}.{stg_table}
+                    INSERT /*+ APPEND PARALLEL(8) */ INTO {SCHEMA}.{table_name}
+                    SELECT /*+ PARALLEL(8) */ * FROM {SCHEMA}.{stg_table}
                 """)
+                rows_merged = cursor.rowcount
                 connection.commit()
                 
-                total_rows += count
-                print(f"    Merged {stg_table}: {count:,} rows")
+                merge_count += 1
+                print(f"    [{merge_count:03d}] Merged {stg_table}: {rows_merged:,} rows")
+                
+                # Clear memory every 10 merges
+                if merge_count % 10 == 0:
+                    gc.collect()
                 
             except Exception as e:
                 print(f"    Error merging {stg_table}: {e}")
         
         cursor.close()
         connection.close()
+        gc.collect()
         
     except Exception as e:
         print(f"  Error in merge: {e}")
     
-    return total_rows
+    return merge_count
 
 def drop_staging_tables(staging_tables):
     """Drop all staging tables"""
@@ -485,133 +458,10 @@ def ensure_indexes_usable(table_name):
     except Exception as e:
         print(f"  Error checking indexes: {e}")
 
-def process_csv_file(csv_file, table_name, truncate_first=False, is_first_file=True):
-    """Process a single CSV file with parallel SQL*Loader"""
-    file_name = os.path.basename(csv_file)
-    file_size = os.path.getsize(csv_file) / (1024 * 1024 * 1024)  # GB
-    
-    print(f"\n{'='*80}")
-    print(f"Processing: {file_name} ({file_size:.2f} GB)")
-    print(f"Table: {SCHEMA}.{table_name}")
-    print(f"{'='*80}")
-    
-    # Create temp directory for chunks
-    temp_dir = tempfile.mkdtemp(prefix=f"sqlldr_{table_name}_")
-    print(f"Temp directory: {temp_dir}")
-    
-    disabled_indexes = []
-    
-    try:
-        # For first file of each table: truncate and disable indexes
-        if is_first_file:
-            if truncate_first:
-                truncate_table(table_name)
-            # Disable indexes for direct path loading
-            if DIRECT_PATH:
-                disabled_indexes = disable_indexes(table_name)
-        
-        # Get header/columns
-        header_parts = get_csv_header(csv_file)
-        
-        # Split the file
-        chunk_files, header = split_csv_file(csv_file, PARALLEL_CHUNKS, temp_dir)
-        
-        if not chunk_files:
-            print("  No chunks created!")
-            return False, 0, table_name, disabled_indexes
-        
-        staging_tables = []
-        
-        if USE_STAGING_TABLES:
-            # Create staging tables (one per chunk - no lock contention!)
-            print(f"  Creating {len(chunk_files)} staging tables...")
-            for i in range(len(chunk_files)):
-                stg = create_staging_table(table_name, i)
-                if stg:
-                    staging_tables.append(stg)
-                else:
-                    print(f"    Failed to create staging table {i}")
-            
-            if len(staging_tables) != len(chunk_files):
-                print("  ERROR: Could not create all staging tables!")
-                return False, 0, table_name, disabled_indexes
-        
-        # Create control files for each chunk
-        print(f"  Creating control files...")
-        ctl_files = []
-        for i, chunk_file in enumerate(chunk_files):
-            # Point to staging table if using staging, else main table
-            target_table = staging_tables[i] if USE_STAGING_TABLES else table_name
-            ctl = create_control_file(target_table, chunk_file, header_parts, temp_dir)
-            ctl_files.append(ctl)
-        
-        # Prepare arguments for parallel execution
-        args_list = [
-            (chunk_files[i], ctl_files[i], staging_tables[i] if USE_STAGING_TABLES else table_name, i, temp_dir)
-            for i in range(len(chunk_files))
-        ]
-        
-        # Run SQL*Loader in parallel (no lock contention with staging tables!)
-        print(f"\n  Loading {len(chunk_files)} chunks in parallel (staging tables = NO LOCKS)...")
-        start_time = datetime.now()
-        
-        with Pool(processes=PARALLEL_CHUNKS) as pool:
-            results = pool.map(run_sqlldr_chunk, args_list)
-        
-        load_elapsed = (datetime.now() - start_time).total_seconds()
-        
-        # Aggregate results
-        total_rows = sum(r[2] for r in results)
-        success_count = sum(1 for r in results if r[1])
-        
-        # Merge staging tables into main table
-        if USE_STAGING_TABLES and success_count > 0:
-            merge_start = datetime.now()
-            merged_rows = merge_staging_tables(table_name, staging_tables)
-            merge_elapsed = (datetime.now() - merge_start).total_seconds()
-            print(f"    Merge time: {merge_elapsed:.1f}s")
-            
-            # Drop staging tables
-            drop_staging_tables(staging_tables)
-        
-        elapsed = (datetime.now() - start_time).total_seconds()
-        
-        print(f"\n  RESULTS for {file_name}:")
-        print(f"    Chunks: {success_count}/{len(chunk_files)} succeeded")
-        print(f"    Rows loaded: {total_rows:,}")
-        print(f"    Time: {elapsed:.1f}s")
-        if total_rows > 0 and elapsed > 0:
-            print(f"    Speed: {total_rows/elapsed:,.0f} rows/second")
-        
-        success = success_count == len(chunk_files)
-        
-        # Cleanup
-        if success:
-            print(f"  Cleaning up temp files...")
-            shutil.rmtree(temp_dir)
-            
-            # Delete original CSV
-            try:
-                os.remove(csv_file)
-                print(f"  Deleted: {file_name}")
-            except Exception as e:
-                print(f"  Warning: Could not delete {file_name}: {e}")
-        else:
-            print(f"  Keeping temp files for debugging: {temp_dir}")
-        
-        gc.collect()
-        return success, total_rows, table_name, disabled_indexes
-        
-    except Exception as e:
-        print(f"  ERROR: {e}")
-        import traceback
-        traceback.print_exc()
-        return False, 0, table_name, disabled_indexes
-
 def main():
     print("="*80)
     print("SQL*LOADER PARALLEL CSV IMPORT")
-    print(f"Splits each CSV into {PARALLEL_CHUNKS} chunks for parallel loading")
+    print(f"Loads {PARALLEL_FILES} CSV files in parallel (no splitting)")
     print("="*80 + "\n")
     
     # Initialize Oracle client
@@ -632,8 +482,9 @@ def main():
     csv_files = set(glob.glob(os.path.join(csv_dir, "*.csv")) + 
                     glob.glob(os.path.join(csv_dir, "*.CSV")))
     
-    # Exclude chunk files from previous runs (contain "_chunk" in name)
-    csv_files = [f for f in csv_files if '_chunk' not in os.path.basename(f).lower()]
+    # Exclude staging/chunk files from previous runs
+    csv_files = [f for f in csv_files if '_chunk' not in os.path.basename(f).lower() 
+                 and '_STG' not in os.path.basename(f)]
     csv_files = sorted(csv_files)
     
     if not csv_files:
@@ -642,10 +493,17 @@ def main():
     
     print(f"Found {len(csv_files)} CSV files:\n")
     total_size = 0
-    for f in csv_files:
+    for i, f in enumerate(csv_files[:10]):  # Show first 10
         size_gb = os.path.getsize(f) / (1024 * 1024 * 1024)
         total_size += size_gb
-        print(f"  - {os.path.basename(f)} ({size_gb:.2f} GB)")
+        print(f"  {i+1:3d}. {os.path.basename(f)} ({size_gb:.2f} GB)")
+    
+    if len(csv_files) > 10:
+        print(f"  ... and {len(csv_files) - 10} more files")
+        for f in csv_files[10:]:
+            total_size += os.path.getsize(f) / (1024 * 1024 * 1024)
+    
+    print(f"\nTotal: {len(csv_files)} files, {total_size:.2f} GB")
     
     # Ask for table name
     table_name = input("\nEnter destination table name: ").strip().upper()
@@ -654,7 +512,6 @@ def main():
         return
     
     print(f"\nAll CSV files will be loaded into: {SCHEMA}.{table_name}")
-    print(f"\nTotal size: {total_size:.2f} GB")
     
     # Ask about truncating FIRST (before index rebuild - makes rebuild instant)
     truncate = input("\nTruncate table before loading? (y/n): ").strip().lower()
@@ -666,38 +523,65 @@ def main():
     # Ensure all indexes are usable (instant after truncate)
     ensure_indexes_usable(table_name)
     
+    # Disable non-unique indexes for faster loading
+    disabled_indexes = []
+    if DIRECT_PATH:
+        print("\nDisabling non-unique indexes for faster loading...")
+        disabled_indexes = disable_indexes(table_name)
+    
+    # Create temp directory for control files and logs
+    temp_dir = tempfile.mkdtemp(prefix=f"sqlldr_{table_name}_")
+    print(f"Temp directory: {temp_dir}")
+    
     print("\n" + "="*80)
-    print("STARTING IMPORT")
+    print(f"LOADING {len(csv_files)} FILES IN PARALLEL")
+    print(f"Parallel processes: {PARALLEL_FILES}")
+    if USE_STAGING_TABLES:
+        print("Mode: Staging tables (NO LOCKS)")
     print("="*80)
     
-    # Track disabled indexes
-    disabled_indexes = []
+    # Prepare arguments for parallel loading
+    args_list = [
+        (csv_file, i, table_name, temp_dir)
+        for i, csv_file in enumerate(csv_files)
+    ]
     
-    total_files = 0
-    total_rows = 0
-    failed_files = []
     start_time = datetime.now()
     
-    for i, csv_file in enumerate(csv_files):
-        is_first = (i == 0)  # Only first file triggers truncate/index disable
-        
-        success, rows, tbl_name, disabled_idx = process_csv_file(
-            csv_file,
-            table_name,
-            truncate_first=False,  # Already truncated above
-            is_first_file=is_first
-        )
-        
-        if is_first and disabled_idx:
-            disabled_indexes = disabled_idx
-        
-        if success:
-            total_files += 1
-            total_rows += rows
-        else:
-            failed_files.append(csv_file)
+    # Load all files in parallel
+    with Pool(processes=min(PARALLEL_FILES, len(csv_files))) as pool:
+        results = pool.map(load_single_file, args_list)
+    
+    # Clear memory after parallel loading
+    gc.collect()
     
     load_elapsed = (datetime.now() - start_time).total_seconds()
+    
+    # Collect results
+    total_rows = sum(r[2] for r in results)
+    success_count = sum(1 for r in results if r[1])
+    failed_files = [r[3] for r in results if not r[1]]
+    staging_tables = [r[4] for r in results if r[1] and r[4]]  # Only successful ones
+    
+    print(f"\n  Files loaded: {success_count}/{len(csv_files)}")
+    print(f"  Rows in staging: {total_rows:,}")
+    print(f"  Load time: {load_elapsed:.1f}s")
+    
+    # Merge staging tables into main table
+    if USE_STAGING_TABLES and staging_tables:
+        print("\n" + "="*80)
+        print(f"MERGING {len(staging_tables)} STAGING TABLES INTO {table_name}")
+        print("="*80)
+        
+        merge_start = datetime.now()
+        tables_merged = merge_staging_tables(table_name, staging_tables)
+        merge_elapsed = (datetime.now() - merge_start).total_seconds()
+        
+        print(f"\n  Merged {tables_merged} staging tables")
+        print(f"  Merge time: {merge_elapsed:.1f}s ({merge_elapsed/60:.1f} min)")
+        
+        # Drop staging tables
+        drop_staging_tables(staging_tables)
     
     # Rebuild indexes
     if DIRECT_PATH and disabled_indexes:
@@ -708,19 +592,28 @@ def main():
     
     elapsed = (datetime.now() - start_time).total_seconds()
     
+    # Cleanup temp directory
+    try:
+        shutil.rmtree(temp_dir)
+        print(f"\nCleaned up temp directory")
+    except:
+        pass
+    
     print("\n" + "="*80)
     print("FINAL SUMMARY")
     print("="*80)
-    print(f"Files processed: {total_files}/{len(csv_files)}")
+    print(f"Files processed: {success_count}/{len(csv_files)}")
     print(f"Total rows loaded: {total_rows:,}")
     print(f"Load time: {load_elapsed:.1f}s ({load_elapsed/60:.1f} minutes)")
     print(f"Total time (incl index rebuild): {elapsed:.1f}s ({elapsed/60:.1f} minutes)")
     if total_rows > 0 and load_elapsed > 0:
         print(f"Load speed: {total_rows/load_elapsed:,.0f} rows/second")
     if failed_files:
-        print(f"\nFailed files:")
-        for f in failed_files:
-            print(f"  - {f}")
+        print(f"\nFailed files ({len(failed_files)}):")
+        for f in failed_files[:10]:
+            print(f"  - {os.path.basename(f)}")
+        if len(failed_files) > 10:
+            print(f"  ... and {len(failed_files) - 10} more")
     print("="*80)
 
 if __name__ == "__main__":
