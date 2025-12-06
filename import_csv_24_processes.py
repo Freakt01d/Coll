@@ -34,7 +34,7 @@ dest_connection_string = f"{dest_username}/{dest_password}@{dest_dsn}"
 INSERT_BATCH_SIZE = 5000      # Rows per executemany call
 COMMIT_INTERVAL = 25000       # Commit every 25K rows
 SCAN_INTERVAL = 1             # Check for new files every second
-PARALLEL_IMPORTS = 24         # Parallel processes
+PARALLEL_IMPORTS = 8          # Parallel processes for single file chunking
 
 def format_elapsed_time(seconds):
     """Format elapsed time"""
@@ -82,16 +82,30 @@ def truncate_table(table_name):
         print(f"Error truncating table: {e}")
         return False
 
-def import_csv_fast(args):
-    """Import CSV for EDS_COMP table"""
-    csv_file, table_name, process_id, stats_dict = args
+def count_csv_lines(csv_file):
+    """Count total lines in CSV file (excluding header)"""
+    with open(csv_file, 'r', encoding='utf-8') as f:
+        # Check for header
+        first_line = f.readline()
+        has_header = first_line.strip().upper().startswith('INDEX_ID')
+        
+        # Count remaining lines
+        count = sum(1 for _ in f)
+        if not has_header:
+            count += 1  # Include first line if not header
+        
+        return count, has_header
+
+def import_csv_chunk(args):
+    """Import a chunk of CSV for EDS_COMP table"""
+    csv_file, table_name, process_id, start_line, end_line, has_header, stats_dict = args
     
     start_time = time.time()
     total_rows = 0
     failed_rows = 0
     
     file_name = os.path.basename(csv_file)
-    print(f"[P{process_id:02d}] Starting: {file_name}")
+    print(f"[P{process_id}] Starting chunk: lines {start_line:,} to {end_line:,}")
     
     try:
         conn, cursor = create_connection()
@@ -126,24 +140,32 @@ def import_csv_fast(args):
             VALUES ({', '.join(column_binds)})
         """
         
-        # Read and insert in batches
+        # Read and insert only our chunk
         with open(csv_file, 'r', newline='', encoding='utf-8', buffering=16*1024*1024) as infile:
             reader = csv.reader(infile)
             
-            # Check if first row is header
-            first_row = next(reader, None)
-            if first_row and first_row[0].upper() == 'INDEX_ID':
-                # It's a header, skip it
-                pass
-            else:
-                # Not a header, process it
-                if first_row:
-                    reader = [first_row] + list(reader)
+            # Skip header if present
+            if has_header:
+                next(reader, None)
+            
+            # Skip to our start line
+            current_line = 0
+            for _ in range(start_line):
+                next(reader, None)
+                current_line += 1
             
             batch_buffer = []
             commit_counter = 0
+            lines_processed = 0
+            chunk_size = end_line - start_line
             
             for row_num, row in enumerate(reader, 1):
+                # Stop when we've processed our chunk
+                if lines_processed >= chunk_size:
+                    break
+                    
+                lines_processed += 1
+                
                 try:
                     # Convert empty strings to None and handle timestamps
                     converted_row = []
@@ -173,7 +195,7 @@ def import_csv_fast(args):
                     batch_buffer.append(tuple(converted_row))
                     
                 except Exception as e:
-                    print(f"[P{process_id:02d}] Row {row_num} conversion error: {str(e)[:100]}")
+                    print(f"[P{process_id}] Row conversion error: {str(e)[:100]}")
                     failed_rows += 1
                     continue
                 
@@ -190,7 +212,7 @@ def import_csv_fast(args):
                             commit_counter = 0
                             elapsed = time.time() - start_time
                             speed = total_rows / elapsed if elapsed > 0 else 0
-                            print(f"[P{process_id:02d}] {file_name}: {total_rows:,} rows, {speed:,.0f} rows/s")
+                            print(f"[P{process_id}] {file_name}: {total_rows:,} rows, {speed:,.0f} rows/s")
                             
                             # Update shared stats
                             stats_dict[process_id] = (file_name, total_rows, speed)
@@ -201,7 +223,7 @@ def import_csv_fast(args):
                         
                     except Exception as e:
                         error_msg = str(e)
-                        print(f"[P{process_id:02d}] Batch insert error: {error_msg[:100]}")
+                        print(f"[P{process_id}] Batch insert error: {error_msg[:100]}")
                         
                         # Try row by row on error
                         for row in batch_buffer:
@@ -221,7 +243,7 @@ def import_csv_fast(args):
                     cursor.executemany(insert_sql, batch_buffer)
                     total_rows += len(batch_buffer)
                 except Exception as e:
-                    print(f"[P{process_id:02d}] Final batch error: {str(e)[:100]}")
+                    print(f"[P{process_id}] Final batch error: {str(e)[:100]}")
                     for row in batch_buffer:
                         try:
                             cursor.execute(insert_sql, row)
@@ -240,48 +262,59 @@ def import_csv_fast(args):
         elapsed = time.time() - start_time
         speed = total_rows / elapsed if elapsed > 0 else 0
         
-        print(f"[P{process_id:02d}] Completed: {file_name}")
-        print(f"[P{process_id:02d}]   Rows: {total_rows:,} | Failed: {failed_rows} | Time: {format_elapsed_time(elapsed)} | Speed: {speed:,.0f} rows/s")
-        
-        # Delete the file after successful import
-        try:
-            os.remove(csv_file)
-            print(f"[P{process_id:02d}] Deleted: {file_name}")
-        except Exception as e:
-            print(f"[P{process_id:02d}] Warning: Could not delete {csv_file}: {e}")
+        print(f"[P{process_id}] Completed chunk: {total_rows:,} rows | Failed: {failed_rows} | Time: {format_elapsed_time(elapsed)} | Speed: {speed:,.0f} rows/s")
         
         if process_id in stats_dict:
             del stats_dict[process_id]
         
-        return csv_file, True, total_rows, failed_rows, elapsed
+        return process_id, True, total_rows, failed_rows, elapsed
         
     except Exception as e:
-        print(f"[P{process_id:02d}] ERROR processing {file_name}: {e}")
+        print(f"[P{process_id}] ERROR: {e}")
         import traceback
         traceback.print_exc()
-        return csv_file, False, 0, 0, 0
+        return process_id, False, 0, 0, 0
 
-def monitor_and_import_parallel(watch_dir, table_name):
-    """Monitor directory and import CSV files using parallel processes"""
+def import_single_csv_chunked(csv_file, table_name):
+    """Split a single CSV into 8 chunks and process in parallel"""
     print(f"\n{'='*80}")
-    print("EDS_COMP CSV IMPORT - 24 PARALLEL PROCESSES")
+    print(f"EDS_COMP CSV IMPORT - {PARALLEL_IMPORTS} PARALLEL CHUNKS")
     print(f"{'='*80}")
-    print(f"Directory: {watch_dir}")
+    print(f"File: {csv_file}")
     print(f"Table: {table_name}")
-    print(f"Processes: {PARALLEL_IMPORTS}")
+    print(f"Chunks: {PARALLEL_IMPORTS}")
     print(f"Batch size: {INSERT_BATCH_SIZE:,} rows")
     print(f"Commit interval: {COMMIT_INTERVAL:,} rows")
-    print(f"\nPress Ctrl+C to stop")
     print(f"{'='*80}\n")
     
-    initial_files = glob.glob(os.path.join(watch_dir, "*.csv"))
-    print(f"Found {len(initial_files)} CSV files to process\n")
+    # Count total lines
+    print("Counting rows in CSV...")
+    total_lines, has_header = count_csv_lines(csv_file)
+    print(f"Total data rows: {total_lines:,}")
+    print(f"Has header: {has_header}\n")
     
-    processed_files = set()
-    total_files = 0
+    # Calculate chunk sizes
+    chunk_size = total_lines // PARALLEL_IMPORTS
+    remainder = total_lines % PARALLEL_IMPORTS
+    
+    # Create chunk ranges
+    chunks = []
+    current_start = 0
+    for i in range(PARALLEL_IMPORTS):
+        # Distribute remainder across first few chunks
+        extra = 1 if i < remainder else 0
+        chunk_end = current_start + chunk_size + extra
+        chunks.append((current_start, chunk_end))
+        current_start = chunk_end
+    
+    print("Chunk distribution:")
+    for i, (start, end) in enumerate(chunks):
+        print(f"  P{i}: lines {start:,} to {end:,} ({end-start:,} rows)")
+    print()
+    
+    start_time = time.time()
     total_rows = 0
     total_failed = 0
-    start_time = time.time()
     
     manager = Manager()
     stats_dict = manager.dict()
@@ -289,74 +322,57 @@ def monitor_and_import_parallel(watch_dir, table_name):
     pool = Pool(processes=PARALLEL_IMPORTS, initializer=init_oracle_client)
     
     try:
-        while True:
-            csv_files = sorted(glob.glob(os.path.join(watch_dir, "*.csv")))
-            new_files = [f for f in csv_files if f not in processed_files]
-            
-            if new_files:
-                print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Processing {len(new_files)} files...")
-                
-                batch_size = min(PARALLEL_IMPORTS, len(new_files))
-                
-                for i in range(0, len(new_files), batch_size):
-                    batch_files = new_files[i:i+batch_size]
-                    
-                    import_args = [
-                        (f, table_name, idx % PARALLEL_IMPORTS, stats_dict) 
-                        for idx, f in enumerate(batch_files, start=i)
-                    ]
-                    
-                    results = pool.map(import_csv_fast, import_args)
-                    
-                    for csv_file, success, rows, failed, elapsed in results:
-                        if success:
-                            processed_files.add(csv_file)
-                            total_files += 1
-                            total_rows += rows
-                            total_failed += failed
-                
-                elapsed_total = time.time() - start_time
-                overall_speed = total_rows / elapsed_total if elapsed_total > 0 else 0
-                
-                print(f"\n{'='*80}")
-                print(f"CUMULATIVE STATISTICS:")
-                print(f"  Files: {total_files:,} processed")
-                print(f"  Rows: {total_rows:,} imported, {total_failed:,} failed")
-                print(f"  Speed: {overall_speed:,.0f} rows/second average")
-                print(f"  Time: {format_elapsed_time(elapsed_total)}")
-                print(f"{'='*80}")
-            
-            remaining_files = glob.glob(os.path.join(watch_dir, "*.csv"))
-            if not remaining_files and len(processed_files) > 0:
-                print("\nAll CSV files have been processed and deleted!")
-                break
-            
-            time.sleep(SCAN_INTERVAL)
-            
+        # Prepare arguments for all chunks
+        import_args = [
+            (csv_file, table_name, i, start, end, has_header, stats_dict)
+            for i, (start, end) in enumerate(chunks)
+        ]
+        
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] Starting {PARALLEL_IMPORTS} parallel chunk imports...")
+        
+        # Process all chunks in parallel
+        results = pool.map(import_csv_chunk, import_args)
+        
+        # Aggregate results
+        all_success = True
+        for process_id, success, rows, failed, elapsed in results:
+            total_rows += rows
+            total_failed += failed
+            if not success:
+                all_success = False
+        
+        elapsed_total = time.time() - start_time
+        overall_speed = total_rows / elapsed_total if elapsed_total > 0 else 0
+        
+        print(f"\n{'='*80}")
+        print("IMPORT COMPLETE")
+        print(f"{'='*80}")
+        print(f"Total rows imported: {total_rows:,}")
+        print(f"Total rows failed: {total_failed:,}")
+        print(f"Total time: {format_elapsed_time(elapsed_total)}")
+        print(f"Average speed: {overall_speed:,.0f} rows/second")
+        print(f"{'='*80}")
+        
+        # Delete file after all chunks complete successfully
+        if all_success:
+            try:
+                os.remove(csv_file)
+                print(f"\nDeleted: {csv_file}")
+            except Exception as e:
+                print(f"\nWarning: Could not delete {csv_file}: {e}")
+        
     except KeyboardInterrupt:
         print("\n\nShutting down...")
         pool.terminate()
         pool.join()
     finally:
         pool.close()
-        
-        print(f"\n\n{'='*80}")
-        print("IMPORT COMPLETE")
-        print(f"{'='*80}")
-        print(f"Total files processed: {total_files:,}")
-        print(f"Total rows imported: {total_rows:,}")
-        print(f"Total rows failed: {total_failed:,}")
-        elapsed_total = time.time() - start_time
-        print(f"Total time: {format_elapsed_time(elapsed_total)}")
-        if total_rows > 0 and elapsed_total > 0:
-            print(f"Average speed: {total_rows / elapsed_total:,.0f} rows/second")
-        print(f"{'='*80}")
 
 # Main execution
 if __name__ == "__main__":
     print("="*80)
     print("EDS_COMP CSV IMPORTER")
-    print("24 Parallel Processes")
+    print(f"{PARALLEL_IMPORTS} Parallel Chunks for Single CSV")
     print("="*80 + "\n")
     
     try:
@@ -369,34 +385,30 @@ if __name__ == "__main__":
     table_name = f'{SCHEMA}.EDS_COMP'
     
     if len(sys.argv) > 1:
-        watch_dir = sys.argv[1]
+        csv_file = sys.argv[1]
     else:
-        watch_dir = input("Enter the directory path containing CSV files: ").strip()
+        csv_file = input("Enter the path to the CSV file: ").strip()
     
-    if not os.path.exists(watch_dir):
-        print(f"ERROR: Directory '{watch_dir}' does not exist!")
+    if not os.path.exists(csv_file):
+        print(f"ERROR: File '{csv_file}' does not exist!")
         exit(1)
     
-    csv_count = len(glob.glob(os.path.join(watch_dir, "*.csv")))
-    print(f"\nFound {csv_count} CSV files in {watch_dir}")
-    
-    if csv_count == 0:
-        print("No CSV files found to process!")
+    if not csv_file.endswith('.csv'):
+        print("ERROR: File must be a .csv file!")
         exit(1)
     
-    if csv_count > 0:
-        truncate = input(f"\nTruncate table {table_name} before starting? (y/n): ").strip().lower()
-        if truncate == 'y':
-            if not truncate_table(table_name):
-                cont = input("Failed to truncate. Continue anyway? (y/n): ").strip().lower()
-                if cont != 'y':
-                    exit(1)
+    truncate = input(f"\nTruncate table {table_name} before starting? (y/n): ").strip().lower()
+    if truncate == 'y':
+        if not truncate_table(table_name):
+            cont = input("Failed to truncate. Continue anyway? (y/n): ").strip().lower()
+            if cont != 'y':
+                exit(1)
     
-    print("\nStarting import with 24 parallel processes...")
-    print("This will process all CSV files and delete them after successful import.\n")
+    print(f"\nStarting import with {PARALLEL_IMPORTS} parallel chunks...")
+    print("CSV will be split into chunks and processed in parallel.\n")
     
     try:
-        monitor_and_import_parallel(watch_dir, table_name)
+        import_single_csv_chunked(csv_file, table_name)
     except Exception as e:
         print(f"\nERROR: {e}")
         import traceback
