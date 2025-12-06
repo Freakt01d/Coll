@@ -231,19 +231,18 @@ dest_dsn = oracledb.makedsn(DB_HOST, DB_PORT, sid=DB_SID)
 dest_connection_string = f"{DB_USER}/{DB_PASSWORD}@{dest_dsn}"
 
 def init_oracle_client():
-    """Initialize Oracle client for thick mode (required for direct path)"""
+    """Initialize Oracle client for thick mode (REQUIRED - database uses encryption)"""
     try:
-        # For Windows: specify path to Oracle Instant Client if not in PATH
-        # Example: oracledb.init_oracle_client(lib_dir=r"C:\oracle\instantclient_19_21")
+        # No lib_dir needed - Oracle client is in PATH environment variable
         oracledb.init_oracle_client()
         print("Oracle thick mode initialized")
     except oracledb.ProgrammingError:
         # Already initialized - this is OK
-        pass
+        print("Oracle thick mode already initialized")
     except Exception as e:
-        print(f"WARNING: Oracle thick mode failed: {e}")
-        print("  Make sure Oracle Instant Client is in PATH or set lib_dir")
-        print("  Falling back to thin mode (may have limited functionality)")
+        print(f"ERROR: Oracle thick mode REQUIRED but failed: {e}")
+        print("  Make sure Oracle Instant Client is in PATH")
+        sys.exit(1)
 
 def truncate_table(table_name):
     """Truncate table using oracledb"""
