@@ -51,8 +51,7 @@ def create_connection():
     try:
         connection = oracledb.connect(dest_connection_string)
         cursor = connection.cursor()
-        # Optimize for bulk inserts
-        cursor.setinputsizes(None, INSERT_BATCH_SIZE)
+        # Execute DDL statements first (before setinputsizes which primes for bind variables)
         cursor.execute("ALTER SESSION SET COMMIT_WRITE = 'BATCH,NOWAIT'")
         cursor.execute("ALTER SESSION ENABLE PARALLEL DML")
         cursor.execute("ALTER SESSION SET RECYCLEBIN = OFF")
@@ -60,6 +59,8 @@ def create_connection():
         # Optimize date format
         cursor.execute("ALTER SESSION SET NLS_DATE_FORMAT = 'YYYY-MM-DD HH24:MI:SS'")
         cursor.execute("ALTER SESSION SET NLS_TIMESTAMP_FORMAT = 'YYYY-MM-DD HH24:MI:SS.FF6'")
+        # Set input sizes AFTER DDL statements to avoid DPI-1059 error
+        cursor.setinputsizes(None, INSERT_BATCH_SIZE)
         return connection, cursor
     except Exception as e:
         print(f"Connection error: {e}")
@@ -68,12 +69,16 @@ def create_connection():
 def truncate_table(table_name):
     """Truncate the destination table"""
     try:
-        conn, cursor = create_connection()
+        # Create a simple connection without cursor optimizations for DDL
+        connection = oracledb.connect(dest_connection_string)
+        cursor = connection.cursor()
         print(f"\nTruncating table {table_name}...")
-        cursor.execute(f"TRUNCATE TABLE {table_name}")
+        # Use simple execute for DDL (no bind variables)
+        truncate_sql = f"TRUNCATE TABLE {table_name}"
+        cursor.execute(truncate_sql)
         print("Table truncated successfully.")
         cursor.close()
-        conn.close()
+        connection.close()
         return True
     except Exception as e:
         print(f"Error truncating table: {e}")
@@ -249,7 +254,7 @@ def import_csv_fast(args):
         elapsed = time.time() - start_time
         speed = total_rows / elapsed if elapsed > 0 else 0
         
-        print(f"[P{process_id:02d}] âœ" Completed: {file_name}")
+        print(f"[P{process_id:02d}]  Completed: {file_name}")
         print(f"[P{process_id:02d}]   Rows: {total_rows:,} | Failed: {failed_rows} | Time: {format_elapsed_time(elapsed)} | Speed: {speed:,.0f} rows/s")
         
         # Delete the file after successful import
@@ -372,7 +377,7 @@ def monitor_and_import_parallel(watch_dir, table_name):
             # Check if all files are processed
             remaining_files = glob.glob(os.path.join(watch_dir, "*.csv"))
             if not remaining_files and len(processed_files) > 0:
-                print("\nâœ" All CSV files have been processed and deleted!")
+                print("\ All CSV files have been processed and deleted!")
                 break
             
             # Wait before next scan
