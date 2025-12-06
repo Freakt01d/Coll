@@ -231,11 +231,19 @@ dest_dsn = oracledb.makedsn(DB_HOST, DB_PORT, sid=DB_SID)
 dest_connection_string = f"{DB_USER}/{DB_PASSWORD}@{dest_dsn}"
 
 def init_oracle_client():
-    """Initialize Oracle client for thick mode"""
+    """Initialize Oracle client for thick mode (required for direct path)"""
     try:
+        # For Windows: specify path to Oracle Instant Client if not in PATH
+        # Example: oracledb.init_oracle_client(lib_dir=r"C:\oracle\instantclient_19_21")
         oracledb.init_oracle_client()
+        print("Oracle thick mode initialized")
+    except oracledb.ProgrammingError:
+        # Already initialized - this is OK
+        pass
     except Exception as e:
-        print(f"Oracle client init: {e}")
+        print(f"WARNING: Oracle thick mode failed: {e}")
+        print("  Make sure Oracle Instant Client is in PATH or set lib_dir")
+        print("  Falling back to thin mode (may have limited functionality)")
 
 def truncate_table(table_name):
     """Truncate table using oracledb"""
@@ -373,28 +381,27 @@ def create_staging_table(table_name, chunk_id):
         return None
 
 def merge_staging_tables(table_name, staging_tables):
-    """Merge all staging tables into the main table using parallel INSERT"""
+    """Merge all staging tables into the main table (no parallel to save TEMP space)"""
     print(f"\n  Merging {len(staging_tables)} staging tables into {table_name}...")
     
     merge_count = 0
+    total_rows = 0
     try:
         connection = oracledb.connect(dest_connection_string)
         cursor = connection.cursor()
         
-        # Enable parallel DML for faster merge
-        cursor.execute("ALTER SESSION ENABLE PARALLEL DML")
-        
         for stg_table in staging_tables:
             try:
-                # Fast INSERT without counting first (COUNT is slow on large tables)
+                # Simple APPEND hint - no PARALLEL to avoid TEMP exhaustion
                 cursor.execute(f"""
-                    INSERT /*+ APPEND PARALLEL(8) */ INTO {SCHEMA}.{table_name}
-                    SELECT /*+ PARALLEL(8) */ * FROM {SCHEMA}.{stg_table}
+                    INSERT /*+ APPEND NOLOGGING */ INTO {SCHEMA}.{table_name}
+                    SELECT * FROM {SCHEMA}.{stg_table}
                 """)
                 rows_merged = cursor.rowcount
-                connection.commit()
+                connection.commit()  # Commit after each to release TEMP
                 
                 merge_count += 1
+                total_rows += rows_merged
                 print(f"    [{merge_count:03d}] Merged {stg_table}: {rows_merged:,} rows")
                 
                 # Clear memory every 10 merges
@@ -403,6 +410,7 @@ def merge_staging_tables(table_name, staging_tables):
                 
             except Exception as e:
                 print(f"    Error merging {stg_table}: {e}")
+                connection.rollback()  # Rollback failed merge
         
         cursor.close()
         connection.close()
@@ -411,6 +419,7 @@ def merge_staging_tables(table_name, staging_tables):
     except Exception as e:
         print(f"  Error in merge: {e}")
     
+    print(f"  Total merged: {total_rows:,} rows")
     return merge_count
 
 def drop_staging_tables(staging_tables):
