@@ -4,22 +4,34 @@ import subprocess
 import glob
 import sys
 from datetime import datetime
+import oracledb
 
 # Database connection details
 SCHEMA = "placeholder"
 DB_USER = SCHEMA
 DB_PASSWORD = "placeholder"
-DB_HOST = "placeholder.ocp.cloud"
+DB_HOST = "placeholder"
 DB_PORT = "placeholder"
 DB_SID = "placeholder"
 
 # SQL*Loader connection string
 DB_CONNECT = f"{DB_USER}/{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_SID}"
 
+# oracledb connection string
+dest_dsn = oracledb.makedsn(DB_HOST, DB_PORT, sid=DB_SID)
+dest_connection_string = f"{DB_USER}/{DB_PASSWORD}@{dest_dsn}"
+
 # Performance settings
 ROWS_PER_COMMIT = 50000       # Commit every N rows
 DIRECT_PATH = True            # Use direct path loading (faster)
 PARALLEL = True               # Enable parallel loading
+
+def init_oracle_client():
+    """Initialize Oracle client for thick mode"""
+    try:
+        oracledb.init_oracle_client()
+    except Exception as e:
+        print(f"Oracle client init: {e}")
 
 def parse_insert_to_values(insert_sql):
     """Extract values from an INSERT statement"""
@@ -244,32 +256,106 @@ def run_sqlldr(table_name, ctl_file, csv_file, output_dir):
         return False
 
 def truncate_table(table_name):
-    """Truncate table using sqlplus"""
+    """Truncate table using oracledb"""
     full_table = f"{SCHEMA}.{table_name}"
     print(f"Truncating {full_table}...")
     
-    sql_cmd = f"TRUNCATE TABLE {full_table};"
-    
     try:
-        # Use sqlplus for DDL
-        cmd = ['sqlplus', '-S', DB_CONNECT]
-        result = subprocess.run(cmd, input=sql_cmd, capture_output=True, text=True, timeout=60)
-        
-        if 'ORA-' in result.stdout or 'ORA-' in result.stderr:
-            print(f"  Error: {result.stdout} {result.stderr}")
-            return False
-        
+        connection = oracledb.connect(dest_connection_string)
+        cursor = connection.cursor()
+        cursor.execute(f"TRUNCATE TABLE {full_table}")
+        cursor.close()
+        connection.close()
         print(f"  Truncated {full_table}")
         return True
     except Exception as e:
         print(f"  Error truncating: {e}")
         return False
 
+def get_table_indexes(table_name):
+    """Get all indexes for a table"""
+    try:
+        connection = oracledb.connect(dest_connection_string)
+        cursor = connection.cursor()
+        cursor.execute("""
+            SELECT index_name, uniqueness 
+            FROM all_indexes 
+            WHERE table_name = :1 AND owner = :2
+            AND index_type != 'LOB'
+        """, [table_name.upper(), SCHEMA.upper()])
+        indexes = cursor.fetchall()
+        cursor.close()
+        connection.close()
+        return indexes
+    except Exception as e:
+        print(f"  Error getting indexes: {e}")
+        return []
+
+def disable_indexes(table_name):
+    """Make indexes unusable for faster loading"""
+    indexes = get_table_indexes(table_name)
+    if not indexes:
+        print(f"  No indexes found on {table_name}")
+        return []
+    
+    print(f"  Disabling {len(indexes)} indexes on {table_name}...")
+    disabled = []
+    
+    try:
+        connection = oracledb.connect(dest_connection_string)
+        cursor = connection.cursor()
+        
+        for idx_name, uniqueness in indexes:
+            try:
+                cursor.execute(f"ALTER INDEX {SCHEMA}.{idx_name} UNUSABLE")
+                disabled.append((idx_name, uniqueness))
+                print(f"    Disabled: {idx_name}")
+            except Exception as e:
+                print(f"    Warning: Could not disable {idx_name}: {e}")
+        
+        cursor.close()
+        connection.close()
+    except Exception as e:
+        print(f"  Error: {e}")
+    
+    return disabled
+
+def rebuild_indexes(table_name, indexes=None):
+    """Rebuild indexes after loading"""
+    if indexes is None:
+        indexes = get_table_indexes(table_name)
+    
+    if not indexes:
+        return
+    
+    print(f"  Rebuilding {len(indexes)} indexes on {table_name}...")
+    
+    try:
+        connection = oracledb.connect(dest_connection_string)
+        cursor = connection.cursor()
+        
+        for idx_info in indexes:
+            idx_name = idx_info[0] if isinstance(idx_info, tuple) else idx_info
+            try:
+                cursor.execute(f"ALTER INDEX {SCHEMA}.{idx_name} REBUILD PARALLEL")
+                cursor.execute(f"ALTER INDEX {SCHEMA}.{idx_name} NOPARALLEL")
+                print(f"    Rebuilt: {idx_name}")
+            except Exception as e:
+                print(f"    Warning: Could not rebuild {idx_name}: {e}")
+        
+        cursor.close()
+        connection.close()
+    except Exception as e:
+        print(f"  Error: {e}")
+
 def main():
     print("="*80)
     print("SQL*LOADER BULK IMPORT")
     print("Convert SQL INSERT files to CSV and load via SQL*Loader")
     print("="*80 + "\n")
+    
+    # Initialize Oracle client
+    init_oracle_client()
     
     # Get directory
     if len(sys.argv) > 1:
@@ -316,10 +402,21 @@ def main():
     print("STEP 2: Loading data via SQL*Loader")
     print("="*80)
     
+    # Track disabled indexes for rebuilding later
+    table_indexes = {}
+    
     if truncate == 'y':
         print("\nTruncating tables...")
         for table_name, _, _, _ in tables:
             truncate_table(table_name)
+    
+    # Disable indexes for direct path loading
+    if DIRECT_PATH:
+        print("\nDisabling indexes for direct path loading...")
+        for table_name, _, _, _ in tables:
+            disabled = disable_indexes(table_name)
+            if disabled:
+                table_indexes[table_name] = disabled
     
     success_count = 0
     total_rows = 0
@@ -330,6 +427,16 @@ def main():
             success_count += 1
             total_rows += row_count
     
+    load_elapsed = (datetime.now() - start_time).total_seconds()
+    
+    # Rebuild indexes
+    if DIRECT_PATH and table_indexes:
+        print("\n" + "="*80)
+        print("STEP 3: Rebuilding indexes")
+        print("="*80)
+        for table_name, indexes in table_indexes.items():
+            rebuild_indexes(table_name, indexes)
+    
     elapsed = (datetime.now() - start_time).total_seconds()
     
     print("\n" + "="*80)
@@ -337,9 +444,10 @@ def main():
     print("="*80)
     print(f"Tables loaded: {success_count}/{len(tables)}")
     print(f"Total rows: {total_rows:,}")
-    print(f"Total time: {elapsed:.1f}s")
-    if total_rows > 0 and elapsed > 0:
-        print(f"Speed: {total_rows/elapsed:,.0f} rows/second")
+    print(f"Load time: {load_elapsed:.1f}s")
+    print(f"Total time (incl index rebuild): {elapsed:.1f}s")
+    if total_rows > 0 and load_elapsed > 0:
+        print(f"Load speed: {total_rows/load_elapsed:,.0f} rows/second")
     print("="*80)
 
 if __name__ == "__main__":
