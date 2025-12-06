@@ -389,12 +389,15 @@ if __name__ == "__main__":
     else:
         csv_file = input("Enter the path to the CSV file: ").strip()
     
+    # Remove quotes if user wrapped path in quotes
+    csv_file = csv_file.strip('"').strip("'")
+    
     if not os.path.exists(csv_file):
         print(f"ERROR: File '{csv_file}' does not exist!")
         exit(1)
     
     if not csv_file.lower().endswith('.csv'):
-        print("ERROR: File must be a .csv file!")
+        print(f"ERROR: File must be a .csv file! Got: '{csv_file}'")
         exit(1)
     
     truncate = input(f"\nTruncate table {table_name} before starting? (y/n): ").strip().lower()
