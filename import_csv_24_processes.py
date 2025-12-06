@@ -25,7 +25,7 @@ DB_CONNECT = f"{DB_USER}/{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_SID}"
 PARALLEL_CHUNKS = 16          # Split each CSV into this many chunks
 ROWS_PER_COMMIT = 100000      # Commit every N rows
 DIRECT_PATH = True            # Fast direct path - indexes handled separately
-STAGGER_DELAY = 2.0           # Seconds delay between starting each loader (avoids lock contention)
+USE_STAGING_TABLES = True     # Use staging tables for lock-free parallel loading
 
 # Table configuration - maps CSV filename pattern to table name
 # If CSV filename is "EDS_COMP_001.csv", it will use table EDS_COMP
@@ -204,8 +204,7 @@ def run_sqlldr_chunk(args):
     """Run SQL*Loader for a single chunk"""
     chunk_file, ctl_file, table_name, chunk_id, output_dir = args
     
-    # Stagger start to avoid lock contention (ORA-00054)
-    time.sleep(chunk_id * STAGGER_DELAY)
+    # No stagger needed with staging tables - each loads to its own table
     
     base = os.path.splitext(os.path.basename(chunk_file))[0]
     log_file = os.path.join(output_dir, f"{base}.log")
@@ -217,6 +216,7 @@ def run_sqlldr_chunk(args):
         f'log={log_file}',
         f'rows={ROWS_PER_COMMIT}',
         'errors=100000',
+        'direct_path_lock_wait=true',  # Wait for lock instead of failing (Oracle 12.2+)
         'bindsize=20000000',
         'readsize=20000000',
         'silent=(header,feedback)',
@@ -377,6 +377,87 @@ def rebuild_indexes(table_name, indexes=None):
     except Exception as e:
         print(f"  Error: {e}")
 
+def create_staging_table(table_name, chunk_id):
+    """Create a staging table for a chunk (copy structure, no data, no indexes)"""
+    staging_name = f"{table_name}_STG{chunk_id:02d}"
+    try:
+        connection = oracledb.connect(dest_connection_string)
+        cursor = connection.cursor()
+        
+        # Drop if exists
+        try:
+            cursor.execute(f"DROP TABLE {SCHEMA}.{staging_name} PURGE")
+        except:
+            pass
+        
+        # Create as copy of main table structure (no data, no indexes)
+        cursor.execute(f"""
+            CREATE TABLE {SCHEMA}.{staging_name} 
+            NOLOGGING 
+            AS SELECT * FROM {SCHEMA}.{table_name} WHERE 1=0
+        """)
+        
+        cursor.close()
+        connection.close()
+        return staging_name
+    except Exception as e:
+        print(f"    Error creating staging table {staging_name}: {e}")
+        return None
+
+def merge_staging_tables(table_name, staging_tables):
+    """Merge all staging tables into the main table"""
+    print(f"\n  Merging {len(staging_tables)} staging tables into {table_name}...")
+    
+    total_rows = 0
+    try:
+        connection = oracledb.connect(dest_connection_string)
+        cursor = connection.cursor()
+        
+        for stg_table in staging_tables:
+            try:
+                # Get row count
+                cursor.execute(f"SELECT COUNT(*) FROM {SCHEMA}.{stg_table}")
+                count = cursor.fetchone()[0]
+                
+                # Insert with APPEND hint for direct path
+                cursor.execute(f"""
+                    INSERT /*+ APPEND */ INTO {SCHEMA}.{table_name}
+                    SELECT * FROM {SCHEMA}.{stg_table}
+                """)
+                connection.commit()
+                
+                total_rows += count
+                print(f"    Merged {stg_table}: {count:,} rows")
+                
+            except Exception as e:
+                print(f"    Error merging {stg_table}: {e}")
+        
+        cursor.close()
+        connection.close()
+        
+    except Exception as e:
+        print(f"  Error in merge: {e}")
+    
+    return total_rows
+
+def drop_staging_tables(staging_tables):
+    """Drop all staging tables"""
+    print(f"\n  Dropping {len(staging_tables)} staging tables...")
+    try:
+        connection = oracledb.connect(dest_connection_string)
+        cursor = connection.cursor()
+        
+        for stg_table in staging_tables:
+            try:
+                cursor.execute(f"DROP TABLE {SCHEMA}.{stg_table} PURGE")
+            except:
+                pass
+        
+        cursor.close()
+        connection.close()
+    except Exception as e:
+        print(f"  Error dropping staging tables: {e}")
+
 def ensure_indexes_usable(table_name):
     """Ensure all indexes are usable before loading (fix from previous failed runs)"""
     try:
@@ -437,33 +518,63 @@ def process_csv_file(csv_file, table_name, truncate_first=False, is_first_file=T
         
         if not chunk_files:
             print("  No chunks created!")
-            return False, 0
+            return False, 0, table_name, disabled_indexes
+        
+        staging_tables = []
+        
+        if USE_STAGING_TABLES:
+            # Create staging tables (one per chunk - no lock contention!)
+            print(f"  Creating {len(chunk_files)} staging tables...")
+            for i in range(len(chunk_files)):
+                stg = create_staging_table(table_name, i)
+                if stg:
+                    staging_tables.append(stg)
+                else:
+                    print(f"    Failed to create staging table {i}")
+            
+            if len(staging_tables) != len(chunk_files):
+                print("  ERROR: Could not create all staging tables!")
+                return False, 0, table_name, disabled_indexes
         
         # Create control files for each chunk
         print(f"  Creating control files...")
         ctl_files = []
-        for chunk_file in chunk_files:
-            ctl = create_control_file(table_name, chunk_file, header_parts, temp_dir)
+        for i, chunk_file in enumerate(chunk_files):
+            # Point to staging table if using staging, else main table
+            target_table = staging_tables[i] if USE_STAGING_TABLES else table_name
+            ctl = create_control_file(target_table, chunk_file, header_parts, temp_dir)
             ctl_files.append(ctl)
         
         # Prepare arguments for parallel execution
         args_list = [
-            (chunk_files[i], ctl_files[i], table_name, i, temp_dir)
+            (chunk_files[i], ctl_files[i], staging_tables[i] if USE_STAGING_TABLES else table_name, i, temp_dir)
             for i in range(len(chunk_files))
         ]
         
-        # Run SQL*Loader in parallel
-        print(f"\n  Loading {len(chunk_files)} chunks in parallel...")
+        # Run SQL*Loader in parallel (no lock contention with staging tables!)
+        print(f"\n  Loading {len(chunk_files)} chunks in parallel (staging tables = NO LOCKS)...")
         start_time = datetime.now()
         
         with Pool(processes=PARALLEL_CHUNKS) as pool:
             results = pool.map(run_sqlldr_chunk, args_list)
         
-        elapsed = (datetime.now() - start_time).total_seconds()
+        load_elapsed = (datetime.now() - start_time).total_seconds()
         
         # Aggregate results
         total_rows = sum(r[2] for r in results)
         success_count = sum(1 for r in results if r[1])
+        
+        # Merge staging tables into main table
+        if USE_STAGING_TABLES and success_count > 0:
+            merge_start = datetime.now()
+            merged_rows = merge_staging_tables(table_name, staging_tables)
+            merge_elapsed = (datetime.now() - merge_start).total_seconds()
+            print(f"    Merge time: {merge_elapsed:.1f}s")
+            
+            # Drop staging tables
+            drop_staging_tables(staging_tables)
+        
+        elapsed = (datetime.now() - start_time).total_seconds()
         
         print(f"\n  RESULTS for {file_name}:")
         print(f"    Chunks: {success_count}/{len(chunk_files)} succeeded")
