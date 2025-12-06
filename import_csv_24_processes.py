@@ -4,6 +4,7 @@ import glob
 import sys
 import tempfile
 import shutil
+import time
 from datetime import datetime
 from multiprocessing import Pool, cpu_count
 import gc
@@ -24,6 +25,7 @@ DB_CONNECT = f"{DB_USER}/{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_SID}"
 PARALLEL_CHUNKS = 16          # Split each CSV into this many chunks
 ROWS_PER_COMMIT = 100000      # Commit every N rows
 DIRECT_PATH = True            # Fast direct path - indexes handled separately
+STAGGER_DELAY = 2.0           # Seconds delay between starting each loader (avoids lock contention)
 
 # Table configuration - maps CSV filename pattern to table name
 # If CSV filename is "EDS_COMP_001.csv", it will use table EDS_COMP
@@ -201,6 +203,9 @@ TRAILING NULLCOLS
 def run_sqlldr_chunk(args):
     """Run SQL*Loader for a single chunk"""
     chunk_file, ctl_file, table_name, chunk_id, output_dir = args
+    
+    # Stagger start to avoid lock contention (ORA-00054)
+    time.sleep(chunk_id * STAGGER_DELAY)
     
     base = os.path.splitext(os.path.basename(chunk_file))[0]
     log_file = os.path.join(output_dir, f"{base}.log")
