@@ -301,20 +301,35 @@ def get_table_indexes(table_name):
         return []
 
 def disable_indexes(table_name):
-    """Make indexes unusable for faster loading"""
+    """Make non-unique indexes unusable for faster loading.
+    NOTE: Unique indexes CANNOT be disabled for direct path loading!
+    """
     indexes = get_table_indexes(table_name)
     if not indexes:
         print(f"  No indexes found on {table_name}")
         return []
     
-    print(f"  Disabling {len(indexes)} indexes on {table_name}...")
+    # Separate unique and non-unique indexes
+    unique_indexes = [(n, u) for n, u in indexes if u == 'UNIQUE']
+    nonunique_indexes = [(n, u) for n, u in indexes if u != 'UNIQUE']
+    
+    if unique_indexes:
+        print(f"  Keeping {len(unique_indexes)} UNIQUE indexes enabled (required for direct path)")
+        for idx_name, _ in unique_indexes:
+            print(f"    Kept: {idx_name}")
+    
+    if not nonunique_indexes:
+        print(f"  No non-unique indexes to disable")
+        return []
+    
+    print(f"  Disabling {len(nonunique_indexes)} non-unique indexes...")
     disabled = []
     
     try:
         connection = oracledb.connect(dest_connection_string)
         cursor = connection.cursor()
         
-        for idx_name, uniqueness in indexes:
+        for idx_name, uniqueness in nonunique_indexes:
             try:
                 cursor.execute(f"ALTER INDEX {SCHEMA}.{idx_name} UNUSABLE")
                 disabled.append((idx_name, uniqueness))
@@ -506,26 +521,29 @@ def main():
     print("STARTING IMPORT")
     print("="*80)
     
-    # Track disabled indexes
-    disabled_indexes = []
+    # Track which tables have been processed and their disabled indexes
+    processed_tables = set()
+    table_indexes = {}  # table_name -> list of disabled indexes
     
     total_files = 0
     total_rows = 0
     failed_files = []
     start_time = datetime.now()
     
-    for i, csv_file in enumerate(csv_files):
-        is_first = (i == 0)  # Only first file triggers truncate/index disable
+    for csv_file in csv_files:
+        table_name = get_table_name(csv_file)
+        is_first = table_name not in processed_tables
         
         success, rows, tbl_name, disabled_idx = process_csv_file(
-            csv_file,
-            table_name,
+            csv_file, 
             truncate_first=(truncate == 'y'),
             is_first_file=is_first
         )
         
-        if is_first and disabled_idx:
-            disabled_indexes = disabled_idx
+        if is_first:
+            processed_tables.add(table_name)
+            if disabled_idx:
+                table_indexes[table_name] = disabled_idx
         
         if success:
             total_files += 1
@@ -535,12 +553,14 @@ def main():
     
     load_elapsed = (datetime.now() - start_time).total_seconds()
     
-    # Rebuild indexes
-    if DIRECT_PATH and disabled_indexes:
+    # Rebuild indexes for all tables
+    if DIRECT_PATH and table_indexes:
         print("\n" + "="*80)
         print("REBUILDING INDEXES")
         print("="*80)
-        rebuild_indexes(table_name, disabled_indexes)
+        
+        for table_name, indexes in table_indexes.items():
+            rebuild_indexes(table_name, indexes)
     
     elapsed = (datetime.now() - start_time).total_seconds()
     
