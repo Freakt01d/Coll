@@ -40,9 +40,10 @@ DEST_SID = "placeholder"
 # PERFORMANCE SETTINGS
 # =============================================================================
 FETCH_BATCH_SIZE = 50000      # Rows to fetch at a time from source
-PARALLEL_CHUNKS = 16          # Split CSV into this many chunks for loading
+PARALLEL_CHUNKS = 16          # Split CSV into this many chunks
 SQLLDR_ROWS = 100000          # SQL*Loader commit interval
 DIRECT_PATH = True            # Use direct path loading (faster)
+STAGGER_DELAY = 0.5           # Seconds delay between starting each loader (avoids lock contention)
 
 # =============================================================================
 # TABLES TO TRANSFER (add your tables here)
@@ -397,6 +398,10 @@ TRAILING NULLCOLS
 def run_sqlldr(args):
     """Run SQL*Loader for a chunk"""
     chunk_file, ctl_file, table_name, chunk_id, output_dir = args
+    
+    # Stagger start to avoid lock contention (ORA-00054)
+    import time
+    time.sleep(chunk_id * STAGGER_DELAY)
     
     base = os.path.splitext(os.path.basename(chunk_file))[0]
     log_file = os.path.join(output_dir, f"{base}.log")
