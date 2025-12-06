@@ -1,418 +1,346 @@
-import oracledb
 import os
-import csv
-from datetime import datetime
-import time
+import re
+import subprocess
 import glob
-import gc
-import multiprocessing
-from multiprocessing import Pool, Manager
 import sys
+from datetime import datetime
 
-# --- Thick Mode Initialization ---
-def init_oracle_client():
-    """Initializes the Oracle client for thick mode."""
-    try:
-        oracledb.init_oracle_client()
-    except Exception as e:
-        print(f"Error initializing Oracle client: {e}")
-        raise
-
-# Destination database connection details
+# Database connection details
 SCHEMA = "placeholder"
-dest_username = SCHEMA
-dest_password = "placeholder"
-dest_hostname = "placeholder.ocp.cloud"
-dest_port = "placeholder"
-dest_sid = "placeholder"
+DB_USER = SCHEMA
+DB_PASSWORD = "placeholder"
+DB_HOST = "placeholder.ocp.cloud"
+DB_PORT = "placeholder"
+DB_SID = "placeholder"
 
-# Create destination connection string
-dest_dsn = oracledb.makedsn(dest_hostname, dest_port, sid=dest_sid)
-dest_connection_string = f"{dest_username}/{dest_password}@{dest_dsn}"
+# SQL*Loader connection string
+DB_CONNECT = f"{DB_USER}/{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_SID}"
 
-# BALANCED PERFORMANCE Configuration
-INSERT_BATCH_SIZE = 5000      # Rows per executemany call
-COMMIT_INTERVAL = 25000       # Commit every 25K rows
-SCAN_INTERVAL = 1             # Check for new files every second
-PARALLEL_IMPORTS = 8          # Parallel processes for single file chunking
+# Performance settings
+ROWS_PER_COMMIT = 50000       # Commit every N rows
+DIRECT_PATH = True            # Use direct path loading (faster)
+PARALLEL = True               # Enable parallel loading
 
-def format_elapsed_time(seconds):
-    """Format elapsed time"""
-    if seconds < 60:
-        return f"{seconds:.0f}s"
-    elif seconds < 3600:
-        return f"{seconds/60:.1f}m"
-    else:
-        hours = seconds / 3600
-        return f"{hours:.1f}h"
+def parse_insert_to_values(insert_sql):
+    """Extract values from an INSERT statement"""
+    # Match: INSERT INTO table (...) VALUES (...)
+    # or: INSERT INTO table VALUES (...)
+    match = re.search(r'VALUES\s*\((.*)\)\s*;?\s*$', insert_sql, re.IGNORECASE | re.DOTALL)
+    if match:
+        values_str = match.group(1)
+        return parse_values(values_str)
+    return None
 
-def create_connection():
-    """Create optimized destination connection"""
-    try:
-        connection = oracledb.connect(dest_connection_string)
-        cursor = connection.cursor()
-        # Execute DDL statements first
-        cursor.execute("ALTER SESSION SET COMMIT_WRITE = 'BATCH,NOWAIT'")
-        cursor.execute("ALTER SESSION DISABLE PARALLEL DML")
-        cursor.execute("ALTER SESSION DISABLE PARALLEL QUERY")
-        cursor.execute("ALTER SESSION SET RECYCLEBIN = OFF")
-        # Optimize date format
-        cursor.execute("ALTER SESSION SET NLS_DATE_FORMAT = 'YYYY-MM-DD HH24:MI:SS'")
-        cursor.execute("ALTER SESSION SET NLS_TIMESTAMP_FORMAT = 'YYYY-MM-DD HH24:MI:SS.FF6'")
-        # Set input sizes AFTER DDL statements
-        cursor.setinputsizes(None, INSERT_BATCH_SIZE)
-        return connection, cursor
-    except Exception as e:
-        print(f"Connection error: {e}")
-        raise
-
-def truncate_table(table_name):
-    """Truncate the destination table"""
-    try:
-        connection = oracledb.connect(dest_connection_string)
-        cursor = connection.cursor()
-        print(f"\nTruncating table {table_name}...")
-        truncate_sql = f"TRUNCATE TABLE {table_name}"
-        cursor.execute(truncate_sql)
-        print("Table truncated successfully.")
-        cursor.close()
-        connection.close()
-        return True
-    except Exception as e:
-        print(f"Error truncating table: {e}")
-        return False
-
-def count_csv_lines(csv_file):
-    """Count total lines in CSV file (excluding header)"""
-    with open(csv_file, 'r', encoding='utf-8') as f:
-        # Check for header
-        first_line = f.readline()
-        has_header = first_line.strip().upper().startswith('INDEX_ID')
-        
-        # Count remaining lines
-        count = sum(1 for _ in f)
-        if not has_header:
-            count += 1  # Include first line if not header
-        
-        return count, has_header
-
-def import_csv_chunk(args):
-    """Import a chunk of CSV for EDS_COMP table"""
-    csv_file, table_name, process_id, start_line, end_line, has_header, stats_dict = args
+def parse_values(values_str):
+    """Parse VALUES clause into list of values"""
+    values = []
+    current_value = ""
+    in_string = False
+    string_char = None
+    paren_depth = 0
     
-    start_time = time.time()
-    total_rows = 0
-    failed_rows = 0
-    
-    file_name = os.path.basename(csv_file)
-    print(f"[P{process_id}] Starting chunk: lines {start_line:,} to {end_line:,}")
-    
-    try:
-        conn, cursor = create_connection()
+    i = 0
+    while i < len(values_str):
+        char = values_str[i]
         
-        # EDS_COMP table columns
-        columns = [
-            'INDEX_ID',           # VARCHAR2(50) - NOT NULL
-            'REF_DATE',           # DATE - NOT NULL
-            'NEXT_HISTO_DATE',    # TIMESTAMP(6) - NULL
-            'LAST_HISTO_DATE',    # TIMESTAMP(6) - NULL
-            'TIME_STAMP',         # TIMESTAMP(6) - NULL
-            'CREATED_DATE',       # TIMESTAMP(6) - NOT NULL
-            'MODIFIED_DATE'       # TIMESTAMP(6) - NULL
-        ]
-        
-        # Build INSERT with proper date/timestamp conversion
-        column_binds = []
-        for i, col in enumerate(columns):
-            if col == 'REF_DATE':
-                # DATE type - use TO_DATE
-                column_binds.append(f"TO_DATE(:{i+1}, 'YYYY-MM-DD HH24:MI:SS')")
-            elif col in ('NEXT_HISTO_DATE', 'LAST_HISTO_DATE', 'TIME_STAMP', 'CREATED_DATE', 'MODIFIED_DATE'):
-                # TIMESTAMP(6) type - use TO_TIMESTAMP
-                column_binds.append(f"TO_TIMESTAMP(:{i+1}, 'YYYY-MM-DD HH24:MI:SS.FF6')")
+        if not in_string:
+            if char in ("'", '"'):
+                in_string = True
+                string_char = char
+                current_value += char
+            elif char == '(':
+                paren_depth += 1
+                current_value += char
+            elif char == ')':
+                paren_depth -= 1
+                current_value += char
+            elif char == ',' and paren_depth == 0:
+                values.append(current_value.strip())
+                current_value = ""
             else:
-                # Regular columns (INDEX_ID)
-                column_binds.append(f":{i+1}")
-        
-        insert_sql = f"""
-            INSERT /*+ NOPARALLEL */ 
-            INTO {table_name} ({', '.join(columns)}) 
-            VALUES ({', '.join(column_binds)})
-        """
-        
-        # Read and insert only our chunk
-        with open(csv_file, 'r', newline='', encoding='utf-8', buffering=16*1024*1024) as infile:
-            reader = csv.reader(infile)
+                current_value += char
+        else:
+            current_value += char
+            if char == string_char:
+                # Check for escaped quote
+                if i + 1 < len(values_str) and values_str[i + 1] == string_char:
+                    i += 1
+                    current_value += string_char
+                else:
+                    in_string = False
+        i += 1
+    
+    if current_value.strip():
+        values.append(current_value.strip())
+    
+    return values
+
+def clean_value(val):
+    """Clean a value for CSV output"""
+    val = val.strip()
+    
+    # Handle NULL
+    if val.upper() == 'NULL':
+        return ''
+    
+    # Handle TO_DATE/TO_TIMESTAMP functions - extract the date string
+    date_match = re.match(r"TO_(?:DATE|TIMESTAMP)\s*\(\s*'([^']+)'", val, re.IGNORECASE)
+    if date_match:
+        return date_match.group(1)
+    
+    # Remove surrounding quotes
+    if (val.startswith("'") and val.endswith("'")) or \
+       (val.startswith('"') and val.endswith('"')):
+        val = val[1:-1]
+        # Unescape doubled quotes
+        val = val.replace("''", "'").replace('""', '"')
+    
+    return val
+
+def convert_sql_to_csv(sql_file, output_dir):
+    """Convert SQL INSERT file to CSV"""
+    base_name = os.path.basename(sql_file)
+    # Extract table name
+    if base_name.lower().endswith('_inserts.sql'):
+        table_name = base_name[:-12]
+    else:
+        table_name = base_name[:-4]
+    
+    csv_file = os.path.join(output_dir, f"{table_name}.csv")
+    
+    print(f"Converting {base_name} -> {table_name}.csv")
+    
+    row_count = 0
+    columns = None
+    
+    with open(sql_file, 'r', encoding='utf-8', errors='replace') as infile:
+        with open(csv_file, 'w', encoding='utf-8', newline='') as outfile:
+            current_statement = ""
             
-            # Skip header if present
-            if has_header:
-                next(reader, None)
-            
-            # Skip to our start line
-            current_line = 0
-            for _ in range(start_line):
-                next(reader, None)
-                current_line += 1
-            
-            batch_buffer = []
-            commit_counter = 0
-            lines_processed = 0
-            chunk_size = end_line - start_line
-            
-            for row_num, row in enumerate(reader, 1):
-                # Stop when we've processed our chunk
-                if lines_processed >= chunk_size:
-                    break
-                    
-                lines_processed += 1
+            for line in infile:
+                line = line.strip()
                 
-                try:
-                    # Convert empty strings to None and handle timestamps
-                    converted_row = []
-                    for i, val in enumerate(row):
-                        if val == '' or val is None:
-                            converted_row.append(None)
-                        elif i == 0:  # INDEX_ID (VARCHAR2)
-                            converted_row.append(val)
-                        elif i == 1:  # REF_DATE (DATE)
-                            # Ensure date format, add time if missing
-                            if val and len(val) == 10:  # Just date YYYY-MM-DD
-                                converted_row.append(val + ' 00:00:00')
-                            else:
-                                converted_row.append(val)
-                        elif i in (2, 3, 4, 5, 6):  # TIMESTAMP columns
-                            # Ensure timestamp format with microseconds
-                            if val and '.' not in val:
-                                if len(val) == 10:  # Just date
-                                    converted_row.append(val + ' 00:00:00.000000')
-                                else:  # Date with time but no microseconds
-                                    converted_row.append(val + '.000000')
-                            else:
-                                converted_row.append(val)
-                        else:
-                            converted_row.append(val)
-                    
-                    batch_buffer.append(tuple(converted_row))
-                    
-                except Exception as e:
-                    print(f"[P{process_id}] Row conversion error: {str(e)[:100]}")
-                    failed_rows += 1
+                # Skip empty lines and comments
+                if not line or line.startswith('--'):
                     continue
                 
-                # Process when buffer is full
-                if len(batch_buffer) >= INSERT_BATCH_SIZE:
-                    try:
-                        cursor.executemany(insert_sql, batch_buffer)
-                        total_rows += len(batch_buffer)
-                        commit_counter += len(batch_buffer)
-                        
-                        # Commit at intervals
-                        if commit_counter >= COMMIT_INTERVAL:
-                            conn.commit()
-                            commit_counter = 0
-                            elapsed = time.time() - start_time
-                            speed = total_rows / elapsed if elapsed > 0 else 0
-                            print(f"[P{process_id}] {file_name}: {total_rows:,} rows, {speed:,.0f} rows/s")
+                current_statement += " " + line
+                
+                # Check if statement is complete (ends with semicolon)
+                if line.endswith(';'):
+                    # Parse the INSERT statement
+                    if 'INSERT' in current_statement.upper():
+                        values = parse_insert_to_values(current_statement)
+                        if values:
+                            # Extract column names from first INSERT if present
+                            if columns is None:
+                                col_match = re.search(r'INSERT\s+INTO\s+\S+\s*\(([^)]+)\)', 
+                                                     current_statement, re.IGNORECASE)
+                                if col_match:
+                                    columns = [c.strip() for c in col_match.group(1).split(',')]
                             
-                            # Update shared stats
-                            stats_dict[process_id] = (file_name, total_rows, speed)
+                            # Clean and write values
+                            cleaned = [clean_value(v) for v in values]
+                            # Escape commas and quotes in values
+                            csv_values = []
+                            for v in cleaned:
+                                if ',' in v or '"' in v or '\n' in v:
+                                    v = '"' + v.replace('"', '""') + '"'
+                                csv_values.append(v)
                             
-                            # GC every 250K rows
-                            if total_rows % 250000 < COMMIT_INTERVAL:
-                                gc.collect()
-                        
-                    except Exception as e:
-                        error_msg = str(e)
-                        print(f"[P{process_id}] Batch insert error: {error_msg[:100]}")
-                        
-                        # Try row by row on error
-                        for row in batch_buffer:
-                            try:
-                                cursor.execute(insert_sql, row)
-                                total_rows += 1
-                                commit_counter += 1
-                            except:
-                                failed_rows += 1
+                            outfile.write(','.join(csv_values) + '\n')
+                            row_count += 1
+                            
+                            if row_count % 100000 == 0:
+                                print(f"  Converted {row_count:,} rows...")
                     
-                    batch_buffer = []
-                    gc.collect()
-            
-            # Process remaining rows
-            if batch_buffer:
-                try:
-                    cursor.executemany(insert_sql, batch_buffer)
-                    total_rows += len(batch_buffer)
-                except Exception as e:
-                    print(f"[P{process_id}] Final batch error: {str(e)[:100]}")
-                    for row in batch_buffer:
-                        try:
-                            cursor.execute(insert_sql, row)
-                            total_rows += 1
-                        except:
-                            failed_rows += 1
-            
-            # Final commit
-            conn.commit()
-        
-        cursor.close()
-        conn.close()
-        
-        gc.collect()
-        
-        elapsed = time.time() - start_time
-        speed = total_rows / elapsed if elapsed > 0 else 0
-        
-        print(f"[P{process_id}] Completed chunk: {total_rows:,} rows | Failed: {failed_rows} | Time: {format_elapsed_time(elapsed)} | Speed: {speed:,.0f} rows/s")
-        
-        if process_id in stats_dict:
-            del stats_dict[process_id]
-        
-        return process_id, True, total_rows, failed_rows, elapsed
-        
-    except Exception as e:
-        print(f"[P{process_id}] ERROR: {e}")
-        import traceback
-        traceback.print_exc()
-        return process_id, False, 0, 0, 0
+                    current_statement = ""
+    
+    print(f"  Done: {row_count:,} rows -> {csv_file}")
+    return table_name, csv_file, row_count, columns
 
-def import_single_csv_chunked(csv_file, table_name):
-    """Split a single CSV into 8 chunks and process in parallel"""
-    print(f"\n{'='*80}")
-    print(f"EDS_COMP CSV IMPORT - {PARALLEL_IMPORTS} PARALLEL CHUNKS")
-    print(f"{'='*80}")
-    print(f"File: {csv_file}")
-    print(f"Table: {table_name}")
-    print(f"Chunks: {PARALLEL_IMPORTS}")
-    print(f"Batch size: {INSERT_BATCH_SIZE:,} rows")
-    print(f"Commit interval: {COMMIT_INTERVAL:,} rows")
-    print(f"{'='*80}\n")
+def create_control_file(table_name, csv_file, columns, output_dir):
+    """Create SQL*Loader control file"""
+    ctl_file = os.path.join(output_dir, f"{table_name}.ctl")
     
-    # Count total lines
-    print("Counting rows in CSV...")
-    total_lines, has_header = count_csv_lines(csv_file)
-    print(f"Total data rows: {total_lines:,}")
-    print(f"Has header: {has_header}\n")
+    # Build column list
+    if columns:
+        col_spec = ',\n    '.join(columns)
+    else:
+        col_spec = "-- columns auto-detected"
     
-    # Calculate chunk sizes
-    chunk_size = total_lines // PARALLEL_IMPORTS
-    remainder = total_lines % PARALLEL_IMPORTS
+    control_content = f"""-- SQL*Loader control file for {table_name}
+-- Generated by sqlldr_import.py
+
+LOAD DATA
+INFILE '{csv_file}'
+BADFILE '{output_dir}/{table_name}.bad'
+DISCARDFILE '{output_dir}/{table_name}.dsc'
+{"APPEND" if not DIRECT_PATH else "APPEND"}
+INTO TABLE {SCHEMA}.{table_name}
+FIELDS TERMINATED BY ',' OPTIONALLY ENCLOSED BY '"'
+TRAILING NULLCOLS
+(
+    {col_spec}
+)
+"""
     
-    # Create chunk ranges
-    chunks = []
-    current_start = 0
-    for i in range(PARALLEL_IMPORTS):
-        # Distribute remainder across first few chunks
-        extra = 1 if i < remainder else 0
-        chunk_end = current_start + chunk_size + extra
-        chunks.append((current_start, chunk_end))
-        current_start = chunk_end
+    with open(ctl_file, 'w') as f:
+        f.write(control_content)
     
-    print("Chunk distribution:")
-    for i, (start, end) in enumerate(chunks):
-        print(f"  P{i}: lines {start:,} to {end:,} ({end-start:,} rows)")
-    print()
+    print(f"  Created control file: {ctl_file}")
+    return ctl_file
+
+def run_sqlldr(table_name, ctl_file, csv_file, output_dir):
+    """Run SQL*Loader for a table"""
+    log_file = os.path.join(output_dir, f"{table_name}.log")
     
-    start_time = time.time()
-    total_rows = 0
-    total_failed = 0
+    cmd = [
+        'sqlldr',
+        f'userid={DB_CONNECT}',
+        f'control={ctl_file}',
+        f'log={log_file}',
+        f'rows={ROWS_PER_COMMIT}',
+        'errors=1000000',  # Allow many errors before stopping
+        'bindsize=20000000',  # 20MB bind buffer
+        'readsize=20000000',  # 20MB read buffer
+    ]
     
-    manager = Manager()
-    stats_dict = manager.dict()
+    if DIRECT_PATH:
+        cmd.append('direct=true')
+    if PARALLEL:
+        cmd.append('parallel=true')
     
-    pool = Pool(processes=PARALLEL_IMPORTS, initializer=init_oracle_client)
+    print(f"\nRunning SQL*Loader for {table_name}...")
+    print(f"  Command: {' '.join(cmd[:3])}...")
+    
+    start_time = datetime.now()
     
     try:
-        # Prepare arguments for all chunks
-        import_args = [
-            (csv_file, table_name, i, start, end, has_header, stats_dict)
-            for i, (start, end) in enumerate(chunks)
-        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=7200)  # 2 hour timeout
         
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] Starting {PARALLEL_IMPORTS} parallel chunk imports...")
+        elapsed = (datetime.now() - start_time).total_seconds()
         
-        # Process all chunks in parallel
-        results = pool.map(import_csv_chunk, import_args)
+        if result.returncode == 0:
+            print(f"  SUCCESS: {table_name} loaded in {elapsed:.1f}s")
+        elif result.returncode == 2:
+            print(f"  WARNING: {table_name} loaded with warnings (check {log_file})")
+        else:
+            print(f"  ERROR: {table_name} failed (return code {result.returncode})")
+            print(f"  Check log: {log_file}")
+            if result.stderr:
+                print(f"  stderr: {result.stderr[:500]}")
         
-        # Aggregate results
-        all_success = True
-        for process_id, success, rows, failed, elapsed in results:
-            total_rows += rows
-            total_failed += failed
-            if not success:
-                all_success = False
+        return result.returncode == 0 or result.returncode == 2
         
-        elapsed_total = time.time() - start_time
-        overall_speed = total_rows / elapsed_total if elapsed_total > 0 else 0
-        
-        print(f"\n{'='*80}")
-        print("IMPORT COMPLETE")
-        print(f"{'='*80}")
-        print(f"Total rows imported: {total_rows:,}")
-        print(f"Total rows failed: {total_failed:,}")
-        print(f"Total time: {format_elapsed_time(elapsed_total)}")
-        print(f"Average speed: {overall_speed:,.0f} rows/second")
-        print(f"{'='*80}")
-        
-        # Delete file after all chunks complete successfully
-        if all_success:
-            try:
-                os.remove(csv_file)
-                print(f"\nDeleted: {csv_file}")
-            except Exception as e:
-                print(f"\nWarning: Could not delete {csv_file}: {e}")
-        
-    except KeyboardInterrupt:
-        print("\n\nShutting down...")
-        pool.terminate()
-        pool.join()
-    finally:
-        pool.close()
+    except subprocess.TimeoutExpired:
+        print(f"  TIMEOUT: {table_name} exceeded 2 hour limit")
+        return False
+    except FileNotFoundError:
+        print("  ERROR: sqlldr not found. Make sure Oracle Client is in PATH.")
+        return False
+    except Exception as e:
+        print(f"  ERROR: {e}")
+        return False
 
-# Main execution
-if __name__ == "__main__":
+def truncate_table(table_name):
+    """Truncate table using sqlplus"""
+    full_table = f"{SCHEMA}.{table_name}"
+    print(f"Truncating {full_table}...")
+    
+    sql_cmd = f"TRUNCATE TABLE {full_table};"
+    
+    try:
+        # Use sqlplus for DDL
+        cmd = ['sqlplus', '-S', DB_CONNECT]
+        result = subprocess.run(cmd, input=sql_cmd, capture_output=True, text=True, timeout=60)
+        
+        if 'ORA-' in result.stdout or 'ORA-' in result.stderr:
+            print(f"  Error: {result.stdout} {result.stderr}")
+            return False
+        
+        print(f"  Truncated {full_table}")
+        return True
+    except Exception as e:
+        print(f"  Error truncating: {e}")
+        return False
+
+def main():
     print("="*80)
-    print("EDS_COMP CSV IMPORTER")
-    print(f"{PARALLEL_IMPORTS} Parallel Chunks for Single CSV")
+    print("SQL*LOADER BULK IMPORT")
+    print("Convert SQL INSERT files to CSV and load via SQL*Loader")
     print("="*80 + "\n")
     
-    try:
-        init_oracle_client()
-    except Exception as e:
-        print(f"CRITICAL: Failed to initialize Oracle client - {e}")
-        exit(1)
-    
-    # Table configuration - fully qualified name
-    table_name = f'{SCHEMA}.EDS_COMP'
-    
+    # Get directory
     if len(sys.argv) > 1:
-        csv_file = sys.argv[1]
+        sql_dir = sys.argv[1]
     else:
-        csv_file = input("Enter the path to the CSV file: ").strip()
+        sql_dir = input("Enter directory containing SQL INSERT files: ").strip()
+        sql_dir = sql_dir.strip('"').strip("'")
     
-    # Remove quotes if user wrapped path in quotes
-    csv_file = csv_file.strip('"').strip("'")
+    if not os.path.exists(sql_dir):
+        print(f"ERROR: Directory '{sql_dir}' does not exist!")
+        return
     
-    if not os.path.exists(csv_file):
-        print(f"ERROR: File '{csv_file}' does not exist!")
-        exit(1)
+    # Find SQL files
+    sql_files = glob.glob(os.path.join(sql_dir, "*.sql"))
     
-    if not csv_file.lower().endswith('.csv'):
-        print(f"ERROR: File must be a .csv file! Got: '{csv_file}'")
-        exit(1)
+    if not sql_files:
+        print("No SQL files found!")
+        return
     
-    truncate = input(f"\nTruncate table {table_name} before starting? (y/n): ").strip().lower()
+    print(f"Found {len(sql_files)} SQL files:\n")
+    for f in sorted(sql_files):
+        size_mb = os.path.getsize(f) / (1024 * 1024)
+        print(f"  - {os.path.basename(f)} ({size_mb:.1f} MB)")
+    
+    # Create output directory for CSV and control files
+    output_dir = os.path.join(sql_dir, "sqlldr_data")
+    os.makedirs(output_dir, exist_ok=True)
+    print(f"\nOutput directory: {output_dir}")
+    
+    # Ask about truncating
+    truncate = input("\nTruncate tables before loading? (y/n): ").strip().lower()
+    
+    print("\n" + "="*80)
+    print("STEP 1: Converting SQL to CSV")
+    print("="*80)
+    
+    tables = []
+    for sql_file in sorted(sql_files):
+        table_name, csv_file, row_count, columns = convert_sql_to_csv(sql_file, output_dir)
+        ctl_file = create_control_file(table_name, csv_file, columns, output_dir)
+        tables.append((table_name, csv_file, ctl_file, row_count))
+    
+    print("\n" + "="*80)
+    print("STEP 2: Loading data via SQL*Loader")
+    print("="*80)
+    
     if truncate == 'y':
-        if not truncate_table(table_name):
-            cont = input("Failed to truncate. Continue anyway? (y/n): ").strip().lower()
-            if cont != 'y':
-                exit(1)
+        print("\nTruncating tables...")
+        for table_name, _, _, _ in tables:
+            truncate_table(table_name)
     
-    print(f"\nStarting import with {PARALLEL_IMPORTS} parallel chunks...")
-    print("CSV will be split into chunks and processed in parallel.\n")
+    success_count = 0
+    total_rows = 0
+    start_time = datetime.now()
     
-    try:
-        import_single_csv_chunked(csv_file, table_name)
-    except Exception as e:
-        print(f"\nERROR: {e}")
-        import traceback
-        traceback.print_exc()
+    for table_name, csv_file, ctl_file, row_count in tables:
+        if run_sqlldr(table_name, ctl_file, csv_file, output_dir):
+            success_count += 1
+            total_rows += row_count
+    
+    elapsed = (datetime.now() - start_time).total_seconds()
+    
+    print("\n" + "="*80)
+    print("SUMMARY")
+    print("="*80)
+    print(f"Tables loaded: {success_count}/{len(tables)}")
+    print(f"Total rows: {total_rows:,}")
+    print(f"Total time: {elapsed:.1f}s")
+    if total_rows > 0 and elapsed > 0:
+        print(f"Speed: {total_rows/elapsed:,.0f} rows/second")
+    print("="*80)
+
+if __name__ == "__main__":
+    main()
