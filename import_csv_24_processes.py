@@ -538,14 +538,17 @@ def main():
         return
     
     print(f"\nAll CSV files will be loaded into: {SCHEMA}.{table_name}")
-    
-    # Ensure all indexes are usable (fix from previous failed runs)
-    ensure_indexes_usable(table_name)
-    
     print(f"\nTotal size: {total_size:.2f} GB")
     
-    # Ask about truncating
-    truncate = input("\nTruncate tables before loading first file? (y/n): ").strip().lower()
+    # Ask about truncating FIRST (before index rebuild - makes rebuild instant)
+    truncate = input("\nTruncate table before loading? (y/n): ").strip().lower()
+    
+    if truncate == 'y':
+        print(f"\nTruncating {SCHEMA}.{table_name}...")
+        truncate_table(table_name)
+    
+    # Ensure all indexes are usable (instant after truncate)
+    ensure_indexes_usable(table_name)
     
     print("\n" + "="*80)
     print("STARTING IMPORT")
@@ -565,7 +568,7 @@ def main():
         success, rows, tbl_name, disabled_idx = process_csv_file(
             csv_file,
             table_name,
-            truncate_first=(truncate == 'y'),
+            truncate_first=False,  # Already truncated above
             is_first_file=is_first
         )
         
