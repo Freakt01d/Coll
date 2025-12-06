@@ -210,33 +210,93 @@ def main():
     if not partitions:
         print("ERROR: No partitions found! Is this a partitioned table?")
         print("\nTrying to extract as non-partitioned table...")
-        # Fall back to single extraction
         partitions = [("FULL_TABLE", None)]
     
-    print(f"Found {len(partitions)} partitions:\n")
+    total_partitions = len(partitions)
+    print(f"Found {total_partitions} partitions total")
+    
+    # Calculate partition ranges for 4 parts
+    part_size = (total_partitions + 3) // 4  # Ceiling division
+    
+    part_ranges = []
+    for i in range(4):
+        start_idx = i * part_size
+        end_idx = min((i + 1) * part_size, total_partitions)
+        if start_idx < total_partitions:
+            part_ranges.append((start_idx, end_idx))
+    
+    # Show parts summary
+    print("\n" + "="*80)
+    print("PARTITION PARTS")
+    print("="*80)
     
     total_rows_estimate = 0
-    for i, (part_name, num_rows) in enumerate(partitions, 1):
-        rows_str = f"{num_rows:,}" if num_rows else "unknown"
-        total_rows_estimate += num_rows or 0
-        print(f"  {i:3d}. {part_name} ({rows_str} rows)")
+    for part_num, (start_idx, end_idx) in enumerate(part_ranges, 1):
+        part_partitions = partitions[start_idx:end_idx]
+        part_rows = sum(r or 0 for _, r in part_partitions)
+        total_rows_estimate += part_rows
+        print(f"\n  Part {part_num}: Partitions {start_idx + 1} to {end_idx} ({end_idx - start_idx} partitions)")
+        print(f"          Estimated rows: {part_rows:,}")
+        # Show first and last partition names
+        if part_partitions:
+            print(f"          First: {part_partitions[0][0]}")
+            print(f"          Last:  {part_partitions[-1][0]}")
     
-    print(f"\nEstimated total rows: {total_rows_estimate:,}")
+    print(f"\n  Total estimated rows: {total_rows_estimate:,}")
+    print("="*80)
+    
+    # Ask which part to extract
+    while True:
+        part_choice = input(f"\nWhich part do you want to extract? (1-{len(part_ranges)}, or 'q' to quit): ").strip().lower()
+        
+        if part_choice == 'q':
+            print("Aborted.")
+            return
+        
+        try:
+            part_num = int(part_choice)
+            if 1 <= part_num <= len(part_ranges):
+                break
+            else:
+                print(f"Please enter a number between 1 and {len(part_ranges)}")
+        except ValueError:
+            print("Invalid input. Enter a number or 'q' to quit.")
+    
+    # Get selected partitions
+    start_idx, end_idx = part_ranges[part_num - 1]
+    selected_partitions = partitions[start_idx:end_idx]
+    
+    print(f"\n" + "="*80)
+    print(f"EXTRACTING PART {part_num}: Partitions {start_idx + 1} to {end_idx}")
+    print(f"Total partitions in this part: {len(selected_partitions)}")
+    print("="*80)
+    
+    # Show selected partitions
+    selected_rows = 0
+    for i, (part_name, num_rows) in enumerate(selected_partitions):
+        rows_str = f"{num_rows:,}" if num_rows else "unknown"
+        selected_rows += num_rows or 0
+        if i < 5 or i >= len(selected_partitions) - 2:  # Show first 5 and last 2
+            print(f"  {start_idx + i + 1:4d}. {part_name} ({rows_str} rows)")
+        elif i == 5:
+            print(f"  ... ({len(selected_partitions) - 7} more partitions) ...")
+    
+    print(f"\nEstimated rows for Part {part_num}: {selected_rows:,}")
     
     # Confirm
-    proceed = input(f"\nProceed with extraction of {len(partitions)} partitions? (y/n): ").strip().lower()
+    proceed = input(f"\nProceed with extraction of Part {part_num} ({len(selected_partitions)} partitions)? (y/n): ").strip().lower()
     if proceed != 'y':
         print("Aborted.")
         return
     
-    # Prepare extraction arguments
+    # Prepare extraction arguments - use original partition index for file naming
     args_list = [
-        (part_name, i, TABLE_NAME, OUTPUT_DIR)
-        for i, (part_name, _) in enumerate(partitions, 1)
+        (part_name, start_idx + i + 1, TABLE_NAME, OUTPUT_DIR)
+        for i, (part_name, _) in enumerate(selected_partitions)
     ]
     
     print("\n" + "="*80)
-    print("STARTING EXTRACTION")
+    print(f"STARTING EXTRACTION - PART {part_num}")
     print(f"Parallel processes: {PARALLEL_EXTRACTS}")
     print("="*80)
     
@@ -250,14 +310,14 @@ def main():
     
     # Summary
     print("\n" + "="*80)
-    print("EXTRACTION COMPLETE")
+    print(f"PART {part_num} EXTRACTION COMPLETE")
     print("="*80)
     
     total_rows = sum(r[2] for r in results)
     success_count = sum(1 for r in results if r[1])
     failed = [r[0] for r in results if not r[1]]
     
-    print(f"Partitions: {success_count}/{len(partitions)} succeeded")
+    print(f"Partitions: {success_count}/{len(selected_partitions)} succeeded")
     print(f"Total rows: {total_rows:,}")
     print(f"Total time: {elapsed:.1f}s ({elapsed/60:.1f} minutes)")
     
@@ -269,21 +329,33 @@ def main():
         for p in failed:
             print(f"  - {p}")
     
-    # List output files
-    print(f"\nOutput files in {OUTPUT_DIR}:")
-    csv_files = sorted([f for f in os.listdir(OUTPUT_DIR) if f.endswith('.csv')])
+    # List output files for this part
+    print(f"\nOutput files for Part {part_num}:")
+    csv_files = sorted([f for f in os.listdir(OUTPUT_DIR) 
+                       if f.startswith(f"{TABLE_NAME}_") and f.endswith('.csv')])
+    # Filter to just this part's files
+    part_files = []
+    for f in csv_files:
+        try:
+            file_num = int(f.replace(f"{TABLE_NAME}_", "").replace(".csv", ""))
+            if start_idx + 1 <= file_num <= end_idx:
+                part_files.append(f)
+        except:
+            pass
+    
     total_size = 0
-    for f in csv_files[:10]:  # Show first 10
+    for f in part_files[:10]:
         size = os.path.getsize(os.path.join(OUTPUT_DIR, f)) / (1024*1024*1024)
         total_size += size
         print(f"  {f} ({size:.2f} GB)")
-    if len(csv_files) > 10:
-        print(f"  ... and {len(csv_files) - 10} more files")
-        for f in csv_files[10:]:
+    if len(part_files) > 10:
+        print(f"  ... and {len(part_files) - 10} more files")
+        for f in part_files[10:]:
             total_size += os.path.getsize(os.path.join(OUTPUT_DIR, f)) / (1024*1024*1024)
     
-    print(f"\nTotal output size: {total_size:.2f} GB")
+    print(f"\nPart {part_num} output size: {total_size:.2f} GB")
     print("="*80)
+    print(f"\nPart {part_num} done. Run script again to extract another part.")
 
 if __name__ == "__main__":
     main()
