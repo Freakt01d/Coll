@@ -393,7 +393,7 @@ if __name__ == "__main__":
         print(f"ERROR: File '{csv_file}' does not exist!")
         exit(1)
     
-    if not csv_file.endswith('.csv'):
+    if not csv_file.lower().endswith('.csv'):
         print("ERROR: File must be a .csv file!")
         exit(1)
     
