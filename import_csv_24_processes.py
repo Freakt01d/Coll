@@ -233,16 +233,20 @@ dest_connection_string = f"{DB_USER}/{DB_PASSWORD}@{dest_dsn}"
 def init_oracle_client():
     """Initialize Oracle client for thick mode (REQUIRED - database uses encryption)"""
     try:
-        # No lib_dir needed - Oracle client is in PATH environment variable
-        oracledb.init_oracle_client()
-        print("Oracle thick mode initialized")
+        # Use specific path to avoid conflicts with multiple Oracle installations
+        oracledb.init_oracle_client(lib_dir=r"D:\Homeware\instantclient_23_0")
+        print("Oracle thick mode initialized (instantclient_23_0)")
     except oracledb.ProgrammingError:
         # Already initialized - this is OK
-        print("Oracle thick mode already initialized")
+        pass
     except Exception as e:
         print(f"ERROR: Oracle thick mode REQUIRED but failed: {e}")
-        print("  Make sure Oracle Instant Client is in PATH")
+        print("  Check path: D:\\Homeware\\instantclient_23_0")
         sys.exit(1)
+
+def worker_init():
+    """Initialize each worker process - MUST call before any DB connection"""
+    init_oracle_client()
 
 def truncate_table(table_name):
     """Truncate table using oracledb"""
@@ -556,8 +560,8 @@ def main():
     
     start_time = datetime.now()
     
-    # Load all files in parallel
-    with Pool(processes=min(PARALLEL_FILES, len(csv_files))) as pool:
+    # Load all files in parallel (worker_init ensures Oracle thick mode in each process)
+    with Pool(processes=min(PARALLEL_FILES, len(csv_files)), initializer=worker_init) as pool:
         results = pool.map(load_single_file, args_list)
     
     # Clear memory after parallel loading
