@@ -1,0 +1,189 @@
+"""
+Merge leftover staging tables into main table
+- Finds all staging tables matching pattern
+- Merges in batches using UNION ALL (fast)
+- Falls back to one-by-one if batch fails (TEMP issue)
+- Optionally rebuilds indexes after merge
+- Drops staging tables after merge
+
+BATCH MERGE ANALYSIS:
+- 10 tables × 1.2M rows = 12M rows per batch
+- 12M rows × ~200 bytes = ~2.4 GB per batch
+- With 128GB TEMP, this is very safe (uses <2% of TEMP)
+- Oracle handles UNION ALL efficiently - no sorting needed
+- INSERT APPEND bypasses buffer cache = fast direct path
+"""
+
+import sys
+import gc
+import oracledb
+from datetime import datetime
+
+# Database connection details
+SCHEMA = "placeholder"
+DB_USER = SCHEMA
+DB_PASSWORD = "placeholder"
+DB_HOST = "placeholder"
+DB_PORT = "placeholder"
+DB_SID = "placeholder"
+
+# Oracle Instant Client path
+ORACLE_CLIENT_PATH = r"D:\Homeware\instantclient_23_0"
+
+def init_oracle_client():
+    try:
+        oracledb.init_oracle_client(lib_dir=ORACLE_CLIENT_PATH)
+        print("Oracle thick mode initialized")
+    except oracledb.ProgrammingError:
+        pass
+    except Exception as e:
+        print(f"ERROR: {e}")
+        sys.exit(1)
+
+def get_connection():
+    dsn = oracledb.makedsn(DB_HOST, DB_PORT, sid=DB_SID)
+    return oracledb.connect(f"{DB_USER}/{DB_PASSWORD}@{dsn}")
+
+def find_staging_tables(table_name):
+    """Find all staging tables for a given table"""
+    conn = get_connection()
+    cursor = conn.cursor()
+    
+    # Find tables matching pattern TABLE_STG*
+    cursor.execute("""
+        SELECT table_name 
+        FROM all_tables 
+        WHERE owner = :1 
+        AND table_name LIKE :2
+        ORDER BY table_name
+    """, [SCHEMA.upper(), f"{table_name.upper()}_STG%"])
+    
+    tables = [row[0] for row in cursor.fetchall()]
+    cursor.close()
+    conn.close()
+    return tables
+
+BATCH_SIZE = 10  # Merge 10 tables at a time with UNION ALL (~12M rows per batch)
+
+def merge_staging_tables(main_table, staging_tables, drop_after=True):
+    """Merge staging tables in batches using UNION ALL (faster)"""
+    print(f"\nMerging {len(staging_tables)} staging tables into {main_table}...")
+    
+    # Split into batches
+    batches = [staging_tables[i:i+BATCH_SIZE] for i in range(0, len(staging_tables), BATCH_SIZE)]
+    print(f"Processing in {len(batches)} batches of {BATCH_SIZE} tables each...\n")
+    
+    conn = get_connection()
+    cursor = conn.cursor()
+    
+    total_rows = 0
+    merged_count = 0
+    failed_tables = []
+    
+    for batch_num, batch in enumerate(batches, 1):
+        try:
+            # Build UNION ALL for this batch
+            union_parts = [f"SELECT * FROM {SCHEMA}.{stg}" for stg in batch]
+            union_query = " UNION ALL ".join(union_parts)
+            
+            cursor.execute(f"""
+                INSERT /*+ APPEND NOLOGGING */ INTO {SCHEMA}.{main_table}
+                {union_query}
+            """)
+            rows = cursor.rowcount
+            conn.commit()
+            
+            total_rows += rows
+            merged_count += len(batch)
+            
+            # Drop staging tables
+            if drop_after:
+                for stg in batch:
+                    try:
+                        cursor.execute(f"DROP TABLE {SCHEMA}.{stg} PURGE")
+                    except:
+                        pass
+            
+            print(f"  Batch {batch_num}/{len(batches)}: {len(batch)} tables, {rows:,} rows (Total: {total_rows:,})")
+                
+        except Exception as e:
+            print(f"  Batch {batch_num} FAILED: {e}")
+            print(f"    Falling back to one-by-one for this batch...")
+            conn.rollback()
+            
+            # Fallback for failed batch
+            for stg in batch:
+                try:
+                    cursor.execute(f"INSERT /*+ APPEND */ INTO {SCHEMA}.{main_table} SELECT * FROM {SCHEMA}.{stg}")
+                    conn.commit()
+                    total_rows += cursor.rowcount
+                    merged_count += 1
+                    if drop_after:
+                        cursor.execute(f"DROP TABLE {SCHEMA}.{stg} PURGE")
+                except Exception as e2:
+                    print(f"      ERROR: {stg}: {e2}")
+                    failed_tables.append(stg)
+                    conn.rollback()
+    
+    cursor.close()
+    conn.close()
+    
+    print(f"\n{'='*60}")
+    print(f"MERGE COMPLETE")
+    print(f"{'='*60}")
+    print(f"Tables merged: {merged_count}/{len(staging_tables)}")
+    print(f"Total rows: {total_rows:,}")
+    if failed_tables:
+        print(f"Failed tables: {len(failed_tables)}")
+        for t in failed_tables[:10]:
+            print(f"  - {t}")
+    print(f"{'='*60}")
+    
+    gc.collect()
+    return total_rows
+
+def main():
+    print("="*60)
+    print("MERGE STAGING TABLES")
+    print("="*60)
+    
+    init_oracle_client()
+    
+    # Get table name
+    table_name = input("\nEnter main table name: ").strip().upper()
+    if not table_name:
+        print("ERROR: Table name required!")
+        return
+    
+    # Find staging tables
+    print(f"\nSearching for staging tables matching {table_name}_STG*...")
+    staging_tables = find_staging_tables(table_name)
+    
+    if not staging_tables:
+        print("No staging tables found!")
+        return
+    
+    print(f"\nFound {len(staging_tables)} staging tables:")
+    for t in staging_tables[:10]:
+        print(f"  - {t}")
+    if len(staging_tables) > 10:
+        print(f"  ... and {len(staging_tables) - 10} more")
+    
+    # Confirm
+    drop_after = input("\nDrop staging tables after merge? (y/n): ").strip().lower() == 'y'
+    confirm = input(f"\nMerge {len(staging_tables)} tables into {table_name}? (y/n): ").strip().lower()
+    
+    if confirm != 'y':
+        print("Cancelled.")
+        return
+    
+    # Merge
+    start_time = datetime.now()
+    merge_staging_tables(table_name, staging_tables, drop_after)
+    
+    elapsed = (datetime.now() - start_time).total_seconds()
+    print(f"\nTotal time: {elapsed:.1f}s ({elapsed/60:.1f} minutes)")
+    print("\nTip: Run rebuild_indexes.py to rebuild any unusable indexes")
+
+if __name__ == "__main__":
+    main()
