@@ -63,15 +63,10 @@ def find_staging_tables(table_name):
     conn.close()
     return tables
 
-BATCH_SIZE = 10  # Merge 10 tables at a time with UNION ALL (~12M rows per batch)
-
 def merge_staging_tables(main_table, staging_tables, drop_after=True):
-    """Merge staging tables in batches using UNION ALL (faster)"""
+    """Merge staging tables one by one, drop immediately after each merge"""
     print(f"\nMerging {len(staging_tables)} staging tables into {main_table}...")
-    
-    # Split into batches
-    batches = [staging_tables[i:i+BATCH_SIZE] for i in range(0, len(staging_tables), BATCH_SIZE)]
-    print(f"Processing in {len(batches)} batches of {BATCH_SIZE} tables each...\n")
+    print("Mode: One by one (drop after each merge)\n")
     
     conn = get_connection()
     cursor = conn.cursor()
@@ -80,50 +75,34 @@ def merge_staging_tables(main_table, staging_tables, drop_after=True):
     merged_count = 0
     failed_tables = []
     
-    for batch_num, batch in enumerate(batches, 1):
+    for i, stg in enumerate(staging_tables, 1):
         try:
-            # Build UNION ALL for this batch
-            union_parts = [f"SELECT * FROM {SCHEMA}.{stg}" for stg in batch]
-            union_query = " UNION ALL ".join(union_parts)
-            
+            # Merge this table
             cursor.execute(f"""
                 INSERT /*+ APPEND NOLOGGING */ INTO {SCHEMA}.{main_table}
-                {union_query}
+                SELECT * FROM {SCHEMA}.{stg}
             """)
             rows = cursor.rowcount
             conn.commit()
             
             total_rows += rows
-            merged_count += len(batch)
+            merged_count += 1
             
-            # Drop staging tables
+            # Drop immediately after merge
             if drop_after:
-                for stg in batch:
-                    try:
-                        cursor.execute(f"DROP TABLE {SCHEMA}.{stg} PURGE")
-                    except:
-                        pass
+                try:
+                    cursor.execute(f"DROP TABLE {SCHEMA}.{stg} PURGE")
+                except:
+                    pass
             
-            print(f"  Batch {batch_num}/{len(batches)}: {len(batch)} tables, {rows:,} rows (Total: {total_rows:,})")
+            # Progress every 10
+            if i % 10 == 0 or i == len(staging_tables):
+                print(f"  [{i:04d}/{len(staging_tables)}] Total: {total_rows:,} rows")
                 
         except Exception as e:
-            print(f"  Batch {batch_num} FAILED: {e}")
-            print(f"    Falling back to one-by-one for this batch...")
+            print(f"  ERROR {stg}: {e}")
+            failed_tables.append(stg)
             conn.rollback()
-            
-            # Fallback for failed batch
-            for stg in batch:
-                try:
-                    cursor.execute(f"INSERT /*+ APPEND */ INTO {SCHEMA}.{main_table} SELECT * FROM {SCHEMA}.{stg}")
-                    conn.commit()
-                    total_rows += cursor.rowcount
-                    merged_count += 1
-                    if drop_after:
-                        cursor.execute(f"DROP TABLE {SCHEMA}.{stg} PURGE")
-                except Exception as e2:
-                    print(f"      ERROR: {stg}: {e2}")
-                    failed_tables.append(stg)
-                    conn.rollback()
     
     cursor.close()
     conn.close()
