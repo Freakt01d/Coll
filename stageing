@@ -63,13 +63,46 @@ def find_staging_tables(table_name):
     conn.close()
     return tables
 
-def merge_staging_tables(main_table, staging_tables, drop_after=True):
-    """Merge staging tables one by one, drop immediately after each merge"""
-    print(f"\nMerging {len(staging_tables)} staging tables into {main_table}...")
-    print("Mode: One by one (drop after each merge)\n")
+def disable_indexes(table_name):
+    """Disable (make unusable) non-unique indexes for faster loading"""
+    print(f"\nDisabling non-unique indexes on {table_name}...")
     
     conn = get_connection()
     cursor = conn.cursor()
+    
+    cursor.execute("""
+        SELECT index_name FROM all_indexes 
+        WHERE table_name = :1 AND owner = :2 
+        AND uniqueness = 'NONUNIQUE'
+        AND index_type != 'LOB'
+    """, [table_name.upper(), SCHEMA.upper()])
+    
+    indexes = [row[0] for row in cursor.fetchall()]
+    
+    for idx in indexes:
+        try:
+            cursor.execute(f"ALTER INDEX {SCHEMA}.{idx} UNUSABLE")
+            print(f"  Disabled: {idx}")
+        except Exception as e:
+            print(f"  {idx}: {e}")
+    
+    cursor.close()
+    conn.close()
+    print(f"  Disabled {len(indexes)} indexes")
+    return indexes
+
+PARALLEL_DEGREE = 8  # Number of parallel processes for merge
+
+def merge_staging_tables(main_table, staging_tables, drop_after=True):
+    """Merge staging tables one by one with PARALLEL execution"""
+    print(f"\nMerging {len(staging_tables)} staging tables into {main_table}...")
+    print(f"Mode: PARALLEL {PARALLEL_DEGREE} (drop after each merge)\n")
+    
+    conn = get_connection()
+    cursor = conn.cursor()
+    
+    # Enable parallel DML for this session
+    cursor.execute("ALTER SESSION ENABLE PARALLEL DML")
     
     total_rows = 0
     merged_count = 0
@@ -77,10 +110,11 @@ def merge_staging_tables(main_table, staging_tables, drop_after=True):
     
     for i, stg in enumerate(staging_tables, 1):
         try:
-            # Merge this table
+            # Merge with PARALLEL hint
             cursor.execute(f"""
-                INSERT /*+ APPEND NOLOGGING */ INTO {SCHEMA}.{main_table}
-                SELECT * FROM {SCHEMA}.{stg}
+                INSERT /*+ APPEND NOLOGGING PARALLEL({PARALLEL_DEGREE}) */ 
+                INTO {SCHEMA}.{main_table}
+                SELECT /*+ PARALLEL({PARALLEL_DEGREE}) */ * FROM {SCHEMA}.{stg}
             """)
             rows = cursor.rowcount
             conn.commit()
@@ -150,19 +184,25 @@ def main():
     
     # Confirm
     drop_after = input("\nDrop staging tables after merge? (y/n): ").strip().lower() == 'y'
+    disable_idx = input("Disable indexes before merge (FASTER)? (y/n): ").strip().lower() == 'y'
     confirm = input(f"\nMerge {len(staging_tables)} tables into {table_name}? (y/n): ").strip().lower()
     
     if confirm != 'y':
         print("Cancelled.")
         return
     
-    # Merge
     start_time = datetime.now()
+    
+    # Disable indexes for faster merge
+    if disable_idx:
+        disable_indexes(table_name)
+    
+    # Merge
     merge_staging_tables(table_name, staging_tables, drop_after)
     
     elapsed = (datetime.now() - start_time).total_seconds()
     print(f"\nTotal time: {elapsed:.1f}s ({elapsed/60:.1f} minutes)")
-    print("\nTip: Run rebuild_indexes.py to rebuild any unusable indexes")
+    print("\nIMPORTANT: Run rebuild_indexes.py to rebuild indexes!")
 
 if __name__ == "__main__":
     main()
