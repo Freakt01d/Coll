@@ -1,226 +1,350 @@
 """
-Extract ALL data from a partitioned table - partition by partition
-- Extracts each partition to a separate CSV
-- Parallel extraction for speed
-- Progress tracking
+Merge leftover staging tables into main table
+- Finds all staging tables matching pattern
+- Merges one by one with PARALLEL execution
+- Supports running multiple instances with batch splits
+- Falls back to one-by-one if batch fails (TEMP issue)
+- Optionally rebuilds indexes after merge
+- Drops staging tables after merge
+
+BATCH MERGE ANALYSIS:
+- 10 tables x 1.2M rows = 12M rows per batch
+- 12M rows x ~200 bytes = ~2.4 GB per batch
+- With 128GB TEMP, this is very safe (uses <2% of TEMP)
+- Oracle handles UNION ALL efficiently - no sorting needed
+- INSERT APPEND bypasses buffer cache = fast direct path
 """
 
-import os
 import sys
-import csv
 import gc
+import time
 import oracledb
 from datetime import datetime
-from multiprocessing import Pool
 
 # Database connection details
-SCHEMA = "placeholder"
+SCHEMA = "YOUR_SCHEMA"
 DB_USER = SCHEMA
-DB_PASSWORD = "placeholder"
-DB_HOST = "placeholder"
-DB_PORT = "placeholder"
-DB_SID = "placeholder"
+DB_PASSWORD = "YOUR_PASSWORD"
+DB_HOST = "your_host.ocp.cloud.example.com"
+DB_PORT = "1522"
+DB_SID = "YOUR_SID"
+
+# Oracle Instant Client path
+ORACLE_CLIENT_PATH = r"D:\Homeware\instantclient_23_0"
 
 # Performance settings
-FETCH_SIZE = 500000       # Rows to fetch at once
-PARALLEL_EXTRACTS = 16    # Parallel partition extractions
-WRITE_BUFFER = 64*1024*1024  # 64MB write buffer
-OUTPUT_DIR = "."          # Output directory
+PARALLEL_DEGREE = 8
+COMMIT_EVERY = 10
 
-# Oracle Instant Client
-ORACLE_CLIENT_PATH = r"D:\Homeware\instantclient_23_0"
+# Batch split settings
+TOTAL_PARTS = 4  # How many parallel instances you want to run
 
 def init_oracle_client():
     try:
         oracledb.init_oracle_client(lib_dir=ORACLE_CLIENT_PATH)
+        print("Oracle thick mode initialized")
     except oracledb.ProgrammingError:
         pass
     except Exception as e:
         print(f"ERROR: {e}")
         sys.exit(1)
 
-def worker_init():
-    """Initialize each worker process"""
-    init_oracle_client()
-
 def get_connection():
     dsn = oracledb.makedsn(DB_HOST, DB_PORT, sid=DB_SID)
-    conn = oracledb.connect(f"{DB_USER}/{DB_PASSWORD}@{dsn}")
-    return conn
+    return oracledb.connect(f"{DB_USER}/{DB_PASSWORD}@{dsn}")
 
-def get_partitions(table_name):
-    """Get all partitions for a table"""
+def find_staging_tables(table_name):
+    """Find all staging tables for a given table"""
     conn = get_connection()
     cursor = conn.cursor()
     
     cursor.execute("""
-        SELECT partition_name, num_rows
-        FROM all_tab_partitions
-        WHERE table_owner = :1 AND table_name = :2
-        ORDER BY partition_position
-    """, [SCHEMA.upper(), table_name.upper()])
+        SELECT table_name
+        FROM all_tables
+        WHERE owner = :1
+        AND table_name LIKE :2
+        ORDER BY table_name
+    """, [SCHEMA.upper(), f"{table_name.upper()}_STG%"])
     
-    partitions = cursor.fetchall()
+    tables = [row[0] for row in cursor.fetchall()]
     cursor.close()
     conn.close()
-    return partitions
+    return tables
 
-def get_columns(table_name):
-    """Get column names for a table"""
+def split_tables_into_parts(tables, total_parts):
+    """Split tables list into N equal parts"""
+    parts = {}
+    total = len(tables)
+    chunk_size = (total + total_parts - 1) // total_parts  # Ceiling division
+    
+    for i in range(total_parts):
+        start_idx = i * chunk_size
+        end_idx = min((i + 1) * chunk_size, total)
+        parts[i + 1] = {
+            'tables': tables[start_idx:end_idx],
+            'start': start_idx + 1,
+            'end': end_idx,
+            'count': end_idx - start_idx
+        }
+    
+    return parts
+
+def disable_indexes(table_name):
+    """Disable (make unusable) non-unique indexes for faster loading"""
+    print(f"\nDisabling non-unique indexes on {table_name}...")
+    
     conn = get_connection()
     cursor = conn.cursor()
     
     cursor.execute("""
-        SELECT column_name FROM all_tab_columns
-        WHERE owner = :1 AND table_name = :2
-        ORDER BY column_id
-    """, [SCHEMA.upper(), table_name.upper()])
+        SELECT index_name FROM all_indexes
+        WHERE table_name = :1 AND owner = :2
+        AND uniqueness = 'NONUNIQUE'
+        AND index_type != 'LOB'
+    """, [table_name.upper(), SCHEMA.upper()])
     
-    columns = [row[0] for row in cursor.fetchall()]
+    indexes = [row[0] for row in cursor.fetchall()]
+    
+    for idx in indexes:
+        try:
+            cursor.execute(f"ALTER INDEX {SCHEMA}.{idx} UNUSABLE")
+            print(f"  Disabled: {idx}")
+        except Exception as e:
+            print(f"  {idx}: {e}")
+    
     cursor.close()
     conn.close()
-    return columns
+    print(f"  Disabled {len(indexes)} indexes")
+    return indexes
 
-def extract_partition(args):
-    """Extract a single partition to CSV"""
-    table_name, partition_name, partition_idx, total, columns, output_dir = args
+def merge_staging_tables(main_table, staging_tables, drop_after=True, part_info=None):
+    """Merge staging tables one by one with PARALLEL execution"""
+    
+    part_label = f" [PART {part_info['part']}/{part_info['total']}]" if part_info else ""
+    print(f"\nMerging {len(staging_tables)} staging tables into {main_table}{part_label}...")
+    print(f"Mode: PARALLEL({PARALLEL_DEGREE}) (drop after each merge)\n")
+    
+    conn = get_connection()
+    cursor = conn.cursor()
+    
+    # Enable parallel DML and skip unusable indexes for this session
+    cursor.execute("ALTER SESSION ENABLE PARALLEL DML")
+    cursor.execute("ALTER SESSION SET SKIP_UNUSABLE_INDEXES = TRUE")
+    
+    # Set table to nologging (only do once - first part or if running single)
+    if part_info is None or part_info['part'] == 1:
+        try:
+            cursor.execute(f"ALTER TABLE {SCHEMA}.{main_table} NOLOGGING")
+            print("Table set to NOLOGGING mode")
+        except Exception as e:
+            print(f"Could not set NOLOGGING: {e}")
+    
+    total_rows = 0
+    merged_count = 0
+    failed_tables = []
+    
+    for i, stg in enumerate(staging_tables, 1):
+        try:
+            start_time = time.time()
+            
+            cursor.execute(f"""
+                INSERT /*+ APPEND PARALLEL({PARALLEL_DEGREE}) */
+                INTO {SCHEMA}.{main_table}
+                SELECT /*+ PARALLEL({PARALLEL_DEGREE}) */ * FROM {SCHEMA}.{stg}
+            """)
+            rows = cursor.rowcount
+            
+            if i % COMMIT_EVERY == 0 or i == len(staging_tables):
+                conn.commit()
+            
+            elapsed = time.time() - start_time
+            total_rows += rows
+            merged_count += 1
+            
+            if drop_after:
+                try:
+                    cursor.execute(f"DROP TABLE {SCHEMA}.{stg} PURGE")
+                except:
+                    pass
+            
+            if i % 10 == 0 or i == len(staging_tables):
+                print(f"  [{i:04d}/{len(staging_tables)}]{part_label} Total: {total_rows:,} rows | Last: {stg} ({rows:,} rows in {elapsed:.1f}s)")
+        
+        except Exception as e:
+            print(f"  ERROR {stg}: {e}")
+            failed_tables.append(stg)
+            conn.rollback()
+    
+    cursor.close()
+    conn.close()
+    
+    print(f"\n{'='*60}")
+    print(f"MERGE COMPLETE{part_label}")
+    print(f"{'='*60}")
+    print(f"Tables merged: {merged_count}/{len(staging_tables)}")
+    print(f"Total rows: {total_rows:,}")
+    if failed_tables:
+        print(f"Failed tables: {len(failed_tables)}")
+        for t in failed_tables[:10]:
+            print(f"  - {t}")
+    print(f"{'='*60}")
     
     gc.collect()
+    return total_rows
+
+def rebuild_indexes(table_name):
+    """Rebuild unusable indexes after merge"""
+    print(f"\nRebuilding indexes on {table_name}...")
     
-    output_file = os.path.join(output_dir, f"{table_name}_{partition_idx:04d}.csv")
+    conn = get_connection()
+    cursor = conn.cursor()
     
-    try:
-        conn = get_connection()
-        cursor = conn.cursor()
-        cursor.arraysize = FETCH_SIZE
-        cursor.prefetchrows = FETCH_SIZE
-        
-        # Query partition
-        col_list = ", ".join(columns)
-        sql = f"SELECT {col_list} FROM {SCHEMA}.{table_name} PARTITION ({partition_name})"
-        cursor.execute(sql)
-        
-        rows_written = 0
-        
-        with open(output_file, 'w', newline='', encoding='utf-8', buffering=WRITE_BUFFER) as f:
-            writer = csv.writer(f)
-            writer.writerow(columns)  # Header
-            
-            while True:
-                rows = cursor.fetchmany(FETCH_SIZE)
-                if not rows:
-                    break
-                writer.writerows(rows)
-                rows_written += len(rows)
-        
+    cursor.execute("""
+        SELECT index_name FROM all_indexes
+        WHERE table_name = :1 AND owner = :2
+        AND status = 'UNUSABLE'
+    """, [table_name.upper(), SCHEMA.upper()])
+    
+    indexes = [row[0] for row in cursor.fetchall()]
+    
+    if not indexes:
+        print("  No unusable indexes found")
         cursor.close()
         conn.close()
-        gc.collect()
-        
-        size_mb = os.path.getsize(output_file) / (1024 * 1024)
-        print(f"  [{partition_idx:04d}/{total}] {partition_name}: {rows_written:,} rows ({size_mb:.1f} MB)")
-        
-        return partition_idx, True, rows_written, output_file
-        
-    except Exception as e:
-        print(f"  [{partition_idx:04d}/{total}] {partition_name}: ERROR - {e}")
-        return partition_idx, False, 0, None
+        return
+    
+    for idx in indexes:
+        try:
+            start = time.time()
+            cursor.execute(f"ALTER INDEX {SCHEMA}.{idx} REBUILD PARALLEL {PARALLEL_DEGREE} NOLOGGING")
+            cursor.execute(f"ALTER INDEX {SCHEMA}.{idx} LOGGING NOPARALLEL")
+            print(f"  Rebuilt: {idx} in {time.time()-start:.1f}s")
+        except Exception as e:
+            print(f"  {idx}: {e}")
+    
+    # Reset table to logging
+    try:
+        cursor.execute(f"ALTER TABLE {SCHEMA}.{table_name} LOGGING")
+        print("  Table set back to LOGGING mode")
+    except:
+        pass
+    
+    cursor.close()
+    conn.close()
+    print(f"  Rebuilt {len(indexes)} indexes")
 
 def main():
-    print("="*70)
-    print("EXTRACT ALL PARTITIONS")
-    print("="*70)
+    print("="*60)
+    print("MERGE STAGING TABLES")
+    print("="*60)
     
     init_oracle_client()
-    print("Oracle thick mode initialized")
     
     # Get table name
-    table_name = input("\nEnter table name: ").strip().upper()
+    table_name = input("\nEnter main table name: ").strip().upper()
     if not table_name:
         print("ERROR: Table name required!")
         return
     
-    # Get partitions
-    print(f"\nFetching partitions for {SCHEMA}.{table_name}...")
-    partitions = get_partitions(table_name)
+    # Find staging tables
+    print(f"\nSearching for staging tables matching {table_name}_STG*...")
+    all_staging_tables = find_staging_tables(table_name)
     
-    if not partitions:
-        print("No partitions found! Is this a partitioned table?")
+    if not all_staging_tables:
+        print("No staging tables found!")
         return
     
-    # Get columns
-    columns = get_columns(table_name)
-    if not columns:
-        print("ERROR: Could not get column list!")
+    print(f"\nFound {len(all_staging_tables)} staging tables total")
+    
+    # Split into parts
+    parts = split_tables_into_parts(all_staging_tables, TOTAL_PARTS)
+    
+    # Show part options
+    print(f"\n{'='*60}")
+    print("SELECT BATCH TO PROCESS")
+    print(f"{'='*60}")
+    print(f"  0 = ALL tables (single process - {len(all_staging_tables)} tables)")
+    for part_num, part_data in parts.items():
+        if part_data['count'] > 0:
+            first_table = part_data['tables'][0] if part_data['tables'] else 'N/A'
+            last_table = part_data['tables'][-1] if part_data['tables'] else 'N/A'
+            print(f"  {part_num} = Part {part_num} ({part_data['count']} tables: {first_table} to {last_table})")
+    print(f"{'='*60}")
+    
+    # Get part selection
+    part_choice = input(f"\nSelect batch [0-{TOTAL_PARTS}]: ").strip()
+    
+    try:
+        part_choice = int(part_choice)
+    except ValueError:
+        print("Invalid selection!")
         return
     
-    # Calculate total rows
-    total_rows = sum(p[1] or 0 for p in partitions)
+    if part_choice == 0:
+        staging_tables = all_staging_tables
+        part_info = None
+        print(f"\nProcessing ALL {len(staging_tables)} tables")
+    elif part_choice in parts and parts[part_choice]['count'] > 0:
+        staging_tables = parts[part_choice]['tables']
+        part_info = {'part': part_choice, 'total': TOTAL_PARTS}
+        print(f"\nProcessing Part {part_choice}: {len(staging_tables)} tables")
+    else:
+        print("Invalid selection!")
+        return
     
-    print(f"\nTable: {SCHEMA}.{table_name}")
-    print(f"Partitions: {len(partitions)}")
-    print(f"Columns: {len(columns)}")
-    print(f"Estimated rows: {total_rows:,}")
+    # Show selected tables
+    print(f"\nTables to process:")
+    for t in staging_tables[:5]:
+        print(f"  - {t}")
+    if len(staging_tables) > 5:
+        print(f"  ... and {len(staging_tables) - 5} more")
     
-    # Output directory
-    output_dir = input(f"\nOutput directory (default: {OUTPUT_DIR}): ").strip() or OUTPUT_DIR
-    if not os.path.exists(output_dir):
-        os.makedirs(output_dir)
-        print(f"Created directory: {output_dir}")
+    # Confirm options
+    drop_after = input("\nDrop staging tables after merge? (y/n): ").strip().lower() == 'y'
     
-    # Optional: extract range
-    print(f"\nExtract range (1 to {len(partitions)}):")
-    start = input(f"  Start partition (default: 1): ").strip()
-    start = int(start) if start.isdigit() else 1
-    end = input(f"  End partition (default: {len(partitions)}): ").strip()
-    end = int(end) if end.isdigit() else len(partitions)
+    # Only ask about indexes for part 1 or full run
+    disable_idx = False
+    rebuild_idx = False
+    if part_choice in [0, 1]:
+        disable_idx = input("Disable indexes before merge (FASTER)? (y/n): ").strip().lower() == 'y'
+        rebuild_idx = input("Rebuild indexes after merge? (y/n): ").strip().lower() == 'y'
+    else:
+        print("\nNote: Run Part 1 first to disable indexes, run Part 1 or 0 last to rebuild indexes")
     
-    # Validate range
-    start = max(1, min(start, len(partitions)))
-    end = max(start, min(end, len(partitions)))
+    confirm = input(f"\nMerge {len(staging_tables)} tables into {table_name}? (y/n): ").strip().lower()
     
-    selected = partitions[start-1:end]
-    selected_rows = sum(p[1] or 0 for p in selected)
-    
-    print(f"\nWill extract {len(selected)} partitions ({start} to {end})")
-    print(f"Estimated rows: {selected_rows:,}")
-    
-    confirm = input("\nContinue? (y/n): ").strip().lower()
     if confirm != 'y':
         print("Cancelled.")
         return
     
-    # Prepare args
-    args_list = [
-        (table_name, part[0], start + i, len(selected), columns, output_dir)
-        for i, part in enumerate(selected)
-    ]
-    
-    print("\n" + "="*70)
-    print(f"EXTRACTING {len(selected)} PARTITIONS (PARALLEL {PARALLEL_EXTRACTS})")
-    print("="*70 + "\n")
-    
     start_time = datetime.now()
     
-    # Extract in parallel
-    with Pool(processes=PARALLEL_EXTRACTS, initializer=worker_init) as pool:
-        results = pool.map(extract_partition, args_list)
+    # Disable indexes (only for part 1 or full run)
+    if disable_idx:
+        disable_indexes(table_name)
+    
+    # Merge
+    merge_staging_tables(table_name, staging_tables, drop_after, part_info)
+    
+    # Rebuild indexes (only for part 1 or full run, typically run after all parts done)
+    if rebuild_idx:
+        rebuild_indexes(table_name)
     
     elapsed = (datetime.now() - start_time).total_seconds()
+    print(f"\nTotal time: {elapsed:.1f}s ({elapsed/60:.1f} minutes)")
     
-    # Summary
-    print("\n" + "="*70)
-    print("EXTRACTION COMPLETE")
-    print("="*70)
+    if part_choice != 0:
+        print(f"\n{'='*60}")
+        print("PARALLEL EXECUTION REMINDER")
+        print(f"{'='*60}")
+        print("Open separate terminals and run other parts simultaneously:")
+        for p in range(1, TOTAL_PARTS + 1):
+            if p != part_choice and parts[p]['count'] > 0:
+                print(f"  python STG.PY  -> Select Part {p}")
+        print(f"{'='*60}")
     
-    success = sum(1 for r in results if r[1])
-    total_rows = sum(r[2] for r in results)
-    
-    print(f"Partitions: {success}/{len(selected)}")
-    print(f"Total rows: {total_rows:,}")
-    print(f"Time: {elapsed:.1f}s ({elapsed/60:.1f} minutes)")
-    print(f"Speed: {total_rows/elapsed:,.0f} rows/sec")
-    print(f"Output: {output_dir}")
+    if disable_idx and not rebuild_idx:
+        print("\nIMPORTANT: Indexes are still UNUSABLE. Rebuild after all parts complete!")
 
 if __name__ == "__main__":
     main()
