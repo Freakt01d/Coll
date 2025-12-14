@@ -2,12 +2,69 @@ import oracledb
 import os
 from glob import glob
 
-def execute_all_sql_files(directory_path, connection_config):
+# Initialize Oracle Client for Thick mode
+# Specify your Oracle Client/Instant Client path
+oracledb.init_oracle_client(lib_dir=r"/path/to/instantclient")
+
+# Common paths:
+# Linux: /usr/lib/oracle/21/client64/lib or /opt/oracle/instantclient_21_3
+# Windows: r"C:\oracle\instantclient_21_3"
+
+
+def execute_sql_file(sql_file_path, connection_config):
     """
-    Execute INSERT statements from all .sql files in a directory.
+    Execute INSERT statements from a .sql file to Oracle database (Thick mode).
     """
     
-    # Find all .sql files
+    with open(sql_file_path, 'r') as f:
+        sql_content = f.read()
+    
+    statements = [stmt.strip() for stmt in sql_content.split(';') if stmt.strip()]
+    insert_statements = [stmt for stmt in statements if stmt.upper().startswith('INSERT')]
+    
+    print(f"Found {len(insert_statements)} INSERT statements")
+    
+    # Connect using Thick mode
+    connection = oracledb.connect(
+        user=connection_config['user'],
+        password=connection_config['password'],
+        dsn=connection_config['dsn']
+    )
+    
+    print(f"Connected in {'Thick' if oracledb.is_thin_mode() == False else 'Thin'} mode")
+    
+    cursor = connection.cursor()
+    
+    success_count = 0
+    error_count = 0
+    
+    try:
+        for i, stmt in enumerate(insert_statements, 1):
+            try:
+                cursor.execute(stmt)
+                success_count += 1
+                
+                if success_count % 1000 == 0:
+                    connection.commit()
+                    print(f"Processed {success_count} statements...")
+                    
+            except oracledb.Error as e:
+                error_count += 1
+                print(f"Error on statement {i}: {e}")
+        
+        connection.commit()
+        print(f"\nCompleted: {success_count} successful, {error_count} errors")
+        
+    finally:
+        cursor.close()
+        connection.close()
+
+
+def execute_all_sql_files(directory_path, connection_config):
+    """
+    Execute INSERT statements from all .sql files in a directory (Thick mode).
+    """
+    
     sql_files = glob(os.path.join(directory_path, '*.sql'))
     
     if not sql_files:
@@ -16,12 +73,14 @@ def execute_all_sql_files(directory_path, connection_config):
     
     print(f"Found {len(sql_files)} .sql files")
     
-    # Connect once for all files
     connection = oracledb.connect(
         user=connection_config['user'],
         password=connection_config['password'],
         dsn=connection_config['dsn']
     )
+    
+    print(f"Connected in {'Thick' if oracledb.is_thin_mode() == False else 'Thin'} mode")
+    
     cursor = connection.cursor()
     
     total_success = 0
@@ -64,6 +123,10 @@ if __name__ == "__main__":
         'dsn': 'myhost.oraclecloud.com:1521/myservice_high'
     }
     
-    sql_directory = '/home/vishal/sql_files/'  # Directory containing .sql files
+    # Option 1: Single file
+    sql_file = '/home/vishal/data/inserts.sql'
+    execute_sql_file(sql_file, config)
     
-    execute_all_sql_files(sql_directory, config)
+    # Option 2: All files in directory
+    # sql_directory = '/home/vishal/sql_files/'
+    # execute_all_sql_files(sql_directory, config)
