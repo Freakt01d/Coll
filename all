@@ -1,452 +1,69 @@
-"""
-Partition Exchange - Staging Tables to Main Table
-- Finds all staging tables matching pattern
-- Checks REF_DATE in each staging table
-- Creates partition if not exists (using LOCK)
-- Exchanges staging table with corresponding partition
-- Supports batch processing with parallel execution
-"""
-
-import sys
-import gc
-import time
 import oracledb
-from datetime import datetime, timedelta
+import os
+from glob import glob
 
-# Database connection details
-SCHEMA = "ABC$OWNER"
-DB_USER = "YOUR_USER"
-DB_PASSWORD = "YOUR_PASSWORD"
-DB_HOST = "your_host.ocp.cloud.example.com"
-DB_PORT = "1522"
-DB_SID = "YOUR_SID"
-
-# Oracle Instant Client path
-ORACLE_CLIENT_PATH = r"D:\Homeware\instantclient_23_0"
-
-# Settings
-TOTAL_PARTS = 4
-EXCLUDE_INDEXES = True  # Set False if staging tables have matching indexes
-WITH_VALIDATION = False  # Set True for extra safety (slower)
-
-def init_oracle_client():
-    try:
-        oracledb.init_oracle_client(lib_dir=ORACLE_CLIENT_PATH)
-        print("Oracle thick mode initialized")
-    except oracledb.ProgrammingError:
-        pass
-    except Exception as e:
-        print(f"ERROR: {e}")
-        sys.exit(1)
-
-def get_connection():
-    dsn = oracledb.makedsn(DB_HOST, DB_PORT, sid=DB_SID)
-    return oracledb.connect(f"{DB_USER}/{DB_PASSWORD}@{dsn}")
-
-def find_staging_tables(table_name):
-    """Find all staging tables for a given table"""
-    conn = get_connection()
-    cursor = conn.cursor()
+def execute_all_sql_files(directory_path, connection_config):
+    """
+    Execute INSERT statements from all .sql files in a directory.
+    """
     
-    cursor.execute("""
-        SELECT table_name
-        FROM all_tables
-        WHERE owner = :1
-        AND table_name LIKE :2
-        ORDER BY table_name
-    """, [SCHEMA.upper(), f"{table_name.upper()}_STG%"])
+    # Find all .sql files
+    sql_files = glob(os.path.join(directory_path, '*.sql'))
     
-    tables = [row[0] for row in cursor.fetchall()]
-    cursor.close()
-    conn.close()
-    return tables
-
-def get_staging_table_date(staging_table):
-    """Get the REF_DATE from staging table"""
-    conn = get_connection()
-    cursor = conn.cursor()
+    if not sql_files:
+        print(f"No .sql files found in {directory_path}")
+        return
+    
+    print(f"Found {len(sql_files)} .sql files")
+    
+    # Connect once for all files
+    connection = oracledb.connect(
+        user=connection_config['user'],
+        password=connection_config['password'],
+        dsn=connection_config['dsn']
+    )
+    cursor = connection.cursor()
+    
+    total_success = 0
+    total_errors = 0
     
     try:
-        cursor.execute(f"""
-            SELECT MIN(REF_DATE), MAX(REF_DATE), COUNT(*)
-            FROM {SCHEMA}.{staging_table}
-        """)
-        row = cursor.fetchone()
-        cursor.close()
-        conn.close()
-        
-        if row and row[0]:
-            return {
-                'min_date': row[0],
-                'max_date': row[1],
-                'count': row[2]
-            }
-        return None
-    except Exception as e:
-        cursor.close()
-        conn.close()
-        print(f"  Error getting date from {staging_table}: {e}")
-        return None
-
-def find_partition_for_date(table_name, ref_date):
-    """Find partition that holds data for given date"""
-    conn = get_connection()
-    cursor = conn.cursor()
-    
-    # Partition high_value is the upper bound (exclusive)
-    # So for data dated 2025-08-01, we need partition with high_value 2025-08-02
-    next_date = ref_date + timedelta(days=1)
-    
-    # Get all partitions and check high_value
-    cursor.execute("""
-        SELECT partition_name, high_value, partition_position
-        FROM all_tab_partitions
-        WHERE table_owner = :1
-        AND table_name = :2
-        ORDER BY partition_position
-    """, [SCHEMA.upper(), table_name.upper()])
-    
-    target_str = next_date.strftime('%Y-%m-%d')
-    
-    for row in cursor.fetchall():
-        partition_name = row[0]
-        high_value = row[1]
-        
-        if target_str in str(high_value):
-            cursor.close()
-            conn.close()
-            return partition_name
-    
-    cursor.close()
-    conn.close()
-    return None
-
-def create_partition_if_not_exists(table_name, ref_date):
-    """Create partition for date using LOCK method"""
-    conn = get_connection()
-    cursor = conn.cursor()
-    
-    try:
-        # Lock forces interval partition creation
-        cursor.execute(f"""
-            LOCK TABLE {SCHEMA}.{table_name}
-            PARTITION FOR (TO_DATE('{ref_date.strftime('%Y-%m-%d')}','YYYY-MM-DD'))
-            IN SHARE MODE
-        """)
-        conn.commit()
-        cursor.close()
-        conn.close()
-        return True
-    except Exception as e:
-        cursor.close()
-        conn.close()
-        # Partition might already exist
-        if 'ORA-14501' in str(e):
-            return True
-        print(f"  Error creating partition: {e}")
-        return False
-
-def exchange_partition(main_table, partition_name, staging_table):
-    """Exchange staging table with partition"""
-    conn = get_connection()
-    cursor = conn.cursor()
-    
-    index_clause = "EXCLUDING INDEXES" if EXCLUDE_INDEXES else "INCLUDING INDEXES"
-    validation_clause = "WITH VALIDATION" if WITH_VALIDATION else "WITHOUT VALIDATION"
-    
-    try:
-        sql = f"""
-            ALTER TABLE {SCHEMA}.{main_table}
-            EXCHANGE PARTITION {partition_name}
-            WITH TABLE {SCHEMA}.{staging_table}
-            {index_clause}
-            {validation_clause}
-        """
-        cursor.execute(sql)
-        conn.commit()
-        cursor.close()
-        conn.close()
-        return True
-    except Exception as e:
-        cursor.close()
-        conn.close()
-        raise e
-
-def get_partition_row_count(table_name, partition_name):
-    """Get row count in partition"""
-    conn = get_connection()
-    cursor = conn.cursor()
-    
-    try:
-        cursor.execute(f"SELECT COUNT(*) FROM {SCHEMA}.{table_name} PARTITION ({partition_name})")
-        count = cursor.fetchone()[0]
-        cursor.close()
-        conn.close()
-        return count
-    except:
-        cursor.close()
-        conn.close()
-        return 0
-
-def split_tables_into_parts(tables, total_parts):
-    """Split tables list into N equal parts"""
-    parts = {}
-    total = len(tables)
-    chunk_size = (total + total_parts - 1) // total_parts
-    
-    for i in range(total_parts):
-        start_idx = i * chunk_size
-        end_idx = min((i + 1) * chunk_size, total)
-        parts[i + 1] = {
-            'tables': tables[start_idx:end_idx],
-            'start': start_idx + 1,
-            'end': end_idx,
-            'count': end_idx - start_idx
-        }
-    
-    return parts
-
-def process_staging_tables(main_table, staging_tables, drop_after=True, batch_info=None):
-    """Process all staging tables - check date, create partition, exchange"""
-    
-    batch_label = f" [PART {batch_info['part']}/{batch_info['total']}]" if batch_info else ""
-    print(f"\nProcessing {len(staging_tables)} staging tables{batch_label}...")
-    print(f"Mode: PARTITION EXCHANGE ({'EXCLUDING' if EXCLUDE_INDEXES else 'INCLUDING'} INDEXES)\n")
-    
-    total_rows = 0
-    success_count = 0
-    failed_tables = []
-    skipped_tables = []
-    
-    conn = get_connection()
-    cursor = conn.cursor()
-    
-    for i, stg in enumerate(staging_tables, 1):
-        try:
-            start_time = time.time()
+        for sql_file in sql_files:
+            print(f"\nProcessing: {os.path.basename(sql_file)}")
             
-            # Step 1: Get staging table date
-            date_info = get_staging_table_date(stg)
+            with open(sql_file, 'r') as f:
+                sql_content = f.read()
             
-            if not date_info:
-                print(f"  [{i:04d}/{len(staging_tables)}] SKIP {stg}: No data or error")
-                skipped_tables.append(stg)
-                continue
+            statements = [s.strip() for s in sql_content.split(';') if s.strip() and s.strip().upper().startswith('INSERT')]
             
-            if date_info['min_date'] != date_info['max_date']:
-                print(f"  [{i:04d}/{len(staging_tables)}] SKIP {stg}: Multiple dates ({date_info['min_date']} to {date_info['max_date']})")
-                skipped_tables.append(stg)
-                continue
-            
-            ref_date = date_info['min_date']
-            row_count = date_info['count']
-            
-            # Step 2: Find or create partition
-            partition_name = find_partition_for_date(main_table, ref_date)
-            
-            if not partition_name:
-                # Create partition using LOCK
-                print(f"  [{i:04d}/{len(staging_tables)}] Creating partition for {ref_date}...")
-                create_partition_if_not_exists(main_table, ref_date)
-                partition_name = find_partition_for_date(main_table, ref_date)
-            
-            if not partition_name:
-                print(f"  [{i:04d}/{len(staging_tables)}] FAIL {stg}: Could not find/create partition for {ref_date}")
-                failed_tables.append(stg)
-                continue
-            
-            # Step 3: Check if partition already has data
-            existing_count = get_partition_row_count(main_table, partition_name)
-            if existing_count > 0:
-                print(f"  [{i:04d}/{len(staging_tables)}] SKIP {stg}: Partition {partition_name} already has {existing_count:,} rows")
-                skipped_tables.append(stg)
-                continue
-            
-            # Step 4: Exchange partition
-            exchange_partition(main_table, partition_name, stg)
-            
-            elapsed = time.time() - start_time
-            total_rows += row_count
-            success_count += 1
-            
-            # Step 5: Drop staging table if requested
-            if drop_after:
+            file_success = 0
+            for stmt in statements:
                 try:
-                    cursor.execute(f"DROP TABLE {SCHEMA}.{stg} PURGE")
-                    conn.commit()
-                except:
-                    pass
+                    cursor.execute(stmt)
+                    file_success += 1
+                except oracledb.Error as e:
+                    total_errors += 1
+                    print(f"  Error: {e}")
             
-            print(f"  [{i:04d}/{len(staging_tables)}]{batch_label} {stg} -> {partition_name} ({row_count:,} rows in {elapsed:.2f}s)")
+            connection.commit()
+            total_success += file_success
+            print(f"  Completed: {file_success} inserts")
         
-        except Exception as e:
-            print(f"  [{i:04d}/{len(staging_tables)}] ERROR {stg}: {e}")
-            failed_tables.append(stg)
-    
-    cursor.close()
-    conn.close()
-    
-    print(f"\n{'='*60}")
-    print(f"EXCHANGE COMPLETE{batch_label}")
-    print(f"{'='*60}")
-    print(f"Success: {success_count}/{len(staging_tables)}")
-    print(f"Skipped: {len(skipped_tables)}")
-    print(f"Failed: {len(failed_tables)}")
-    print(f"Total rows: {total_rows:,}")
-    
-    if failed_tables:
-        print(f"\nFailed tables:")
-        for t in failed_tables[:10]:
-            print(f"  - {t}")
-        if len(failed_tables) > 10:
-            print(f"  ... and {len(failed_tables) - 10} more")
-    
-    if skipped_tables:
-        print(f"\nSkipped tables:")
-        for t in skipped_tables[:10]:
-            print(f"  - {t}")
-        if len(skipped_tables) > 10:
-            print(f"  ... and {len(skipped_tables) - 10} more")
-    
-    print(f"{'='*60}")
-    
-    gc.collect()
-    return total_rows
-
-def rebuild_unusable_indexes(table_name):
-    """Rebuild unusable index partitions after exchange"""
-    print(f"\nRebuilding unusable index partitions on {table_name}...")
-    
-    conn = get_connection()
-    cursor = conn.cursor()
-    
-    # Find unusable index partitions
-    cursor.execute("""
-        SELECT index_name, partition_name
-        FROM all_ind_partitions
-        WHERE index_owner = :1
-        AND status = 'UNUSABLE'
-        AND index_name IN (
-            SELECT index_name FROM all_indexes
-            WHERE table_owner = :1 AND table_name = :2
-        )
-    """, [SCHEMA.upper(), table_name.upper()])
-    
-    unusable = cursor.fetchall()
-    
-    if not unusable:
-        print("  No unusable index partitions found")
+        print(f"\n--- TOTAL: {total_success} successful, {total_errors} errors ---")
+        
+    finally:
         cursor.close()
-        conn.close()
-        return
-    
-    print(f"  Found {len(unusable)} unusable index partitions")
-    
-    for idx_name, part_name in unusable:
-        try:
-            start = time.time()
-            cursor.execute(f"ALTER INDEX {SCHEMA}.{idx_name} REBUILD PARTITION {part_name} PARALLEL 8 NOLOGGING")
-            print(f"  Rebuilt: {idx_name}.{part_name} in {time.time()-start:.1f}s")
-        except Exception as e:
-            print(f"  Error rebuilding {idx_name}.{part_name}: {e}")
-    
-    cursor.close()
-    conn.close()
+        connection.close()
 
-def main():
-    print("="*60)
-    print("PARTITION EXCHANGE - STAGING TO MAIN TABLE")
-    print("="*60)
-    
-    init_oracle_client()
-    
-    # Get table name
-    table_name = input("\nEnter main table name: ").strip().upper()
-    if not table_name:
-        print("ERROR: Table name required!")
-        return
-    
-    # Find staging tables
-    print(f"\nSearching for staging tables matching {table_name}_STG*...")
-    all_staging_tables = find_staging_tables(table_name)
-    
-    if not all_staging_tables:
-        print("No staging tables found!")
-        return
-    
-    print(f"Found {len(all_staging_tables)} staging tables")
-    
-    # Split into parts
-    parts = split_tables_into_parts(all_staging_tables, TOTAL_PARTS)
-    
-    # Show part options
-    print(f"\n{'='*60}")
-    print("SELECT BATCH TO PROCESS")
-    print(f"{'='*60}")
-    print(f"  0 = ALL tables (single process - {len(all_staging_tables)} tables)")
-    for part_num, part_data in parts.items():
-        if part_data['count'] > 0:
-            first_table = part_data['tables'][0] if part_data['tables'] else 'N/A'
-            last_table = part_data['tables'][-1] if part_data['tables'] else 'N/A'
-            print(f"  {part_num} = Part {part_num} ({part_data['count']} tables: {first_table} to {last_table})")
-    print(f"{'='*60}")
-    
-    # Get part selection
-    part_choice = input(f"\nSelect batch [0-{TOTAL_PARTS}]: ").strip()
-    
-    try:
-        part_choice = int(part_choice)
-    except ValueError:
-        print("Invalid selection!")
-        return
-    
-    if part_choice == 0:
-        staging_tables = all_staging_tables
-        batch_info = None
-    elif part_choice in parts and parts[part_choice]['count'] > 0:
-        staging_tables = parts[part_choice]['tables']
-        batch_info = {'part': part_choice, 'total': TOTAL_PARTS}
-    else:
-        print("Invalid selection!")
-        return
-    
-    # Show selected tables
-    print(f"\nTables to process: {len(staging_tables)}")
-    for t in staging_tables[:5]:
-        print(f"  - {t}")
-    if len(staging_tables) > 5:
-        print(f"  ... and {len(staging_tables) - 5} more")
-    
-    # Options
-    drop_after = input("\nDrop staging tables after exchange? (y/n): ").strip().lower() == 'y'
-    rebuild_idx = input("Rebuild unusable indexes after? (y/n): ").strip().lower() == 'y'
-    confirm = input(f"\nProcess {len(staging_tables)} staging tables? (y/n): ").strip().lower()
-    
-    if confirm != 'y':
-        print("Cancelled.")
-        return
-    
-    start_time = datetime.now()
-    
-    # Process exchanges
-    process_staging_tables(table_name, staging_tables, drop_after, batch_info)
-    
-    # Rebuild indexes
-    if rebuild_idx:
-        rebuild_unusable_indexes(table_name)
-    
-    elapsed = (datetime.now() - start_time).total_seconds()
-    print(f"\nTotal time: {elapsed:.1f}s ({elapsed/60:.1f} minutes)")
-    
-    if part_choice != 0:
-        print(f"\n{'='*60}")
-        print("PARALLEL EXECUTION REMINDER")
-        print(f"{'='*60}")
-        print("Open separate terminals and run other parts simultaneously:")
-        for p in range(1, TOTAL_PARTS + 1):
-            if p != part_choice and parts[p]['count'] > 0:
-                print(f"  python PARTITION_EXCHANGE.PY -> Select Part {p}")
-        print(f"{'='*60}")
 
 if __name__ == "__main__":
-    main()
+    
+    config = {
+        'user': 'ADMIN',
+        'password': 'YourPassword123',
+        'dsn': 'myhost.oraclecloud.com:1521/myservice_high'
+    }
+    
+    sql_directory = '/home/vishal/sql_files/'  # Directory containing .sql files
+    
+    execute_all_sql_files(sql_directory, config)
