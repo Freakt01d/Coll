@@ -1,0 +1,34 @@
+from azure.storage.blob import ContainerClient
+import os
+
+# =============================================================================
+# CONFIGURATION
+# =============================================================================
+# Paste your full Blob SAS URL here
+BLOB_SAS_URL = ""
+
+# =============================================================================
+# CREATE CONNECTION
+# =============================================================================
+container_client = ContainerClient.from_container_url(BLOB_SAS_URL)
+
+# =============================================================================
+# MAIN
+# =============================================================================
+if __name__ == "__main__":
+    
+    print("Listing files:")
+    print("-" * 50)
+    
+    # Try without any prefix since SAS is already scoped to adhoc
+    try:
+        blobs = container_client.list_blobs()
+        count = 0
+        for blob in blobs:
+            print(f"{blob.name} - {blob.size} bytes")
+            count += 1
+        
+        if count == 0:
+            print("No files found")
+    except Exception as e:
+        print(f"Error: {e}")
