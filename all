@@ -1,140 +1,102 @@
-from azure.storage.blob import ContainerClient
+from azure.identity import DefaultAzureCredential
+from azure.storage.filedatalake import DataLakeServiceClient
 import os
 
-def download_blobs_from_directory(
-    account_url: str,
-    container_name: str,
-    sas_token: str,
-    directory_prefix: str,
-    local_download_path: str
-) -> list[str]:
+# Your existing setup
+DATA_LAKE_ACCOUNT = os.getenv('DATA_LAKE_ACCOUNT', 'redprdprivatelake')
+DATA_LAKE_FILESYSTEM = os.getenv('DATA_LAKE_FILESYSTEM', 'regression')
+
+# Using DefaultAzureCredential (same as your existing code)
+credential = DefaultAzureCredential()
+service_client = DataLakeServiceClient(
+    f"https://{DATA_LAKE_ACCOUNT}.dfs.core.windows.net",
+    credential=credential
+)
+
+
+def list_directory(directory_path: str = "") -> list[dict]:
     """
-    Download all blobs from a virtual directory in Azure Blob Storage using a SAS token.
-    
-    Args:
-        account_url: The Azure storage account URL (e.g., "https://<account_name>.blob.core.windows.net")
-        container_name: Name of the container
-        sas_token: The SAS token (with or without leading '?')
-        directory_prefix: The virtual directory path (e.g., "folder1/subfolder/")
-        local_download_path: Local directory to save downloaded files
-    
-    Returns:
-        List of downloaded file paths
+    List all files in a directory.
     """
-    # Ensure SAS token starts with '?'
-    if not sas_token.startswith('?'):
-        sas_token = '?' + sas_token
+    filesystem_client = service_client.get_file_system_client(DATA_LAKE_FILESYSTEM)
+    paths = filesystem_client.get_paths(path=directory_path)
     
-    # Create the container client with SAS token
-    container_url = f"{account_url}/{container_name}{sas_token}"
-    container_client = ContainerClient.from_container_url(container_url)
+    file_list = []
+    for path in paths:
+        file_list.append({
+            'name': path.name,
+            'is_directory': path.is_directory,
+            'size': path.content_length,
+            'last_modified': path.last_modified
+        })
+    return file_list
+
+
+def download_file(remote_path: str, local_path: str) -> str:
+    """
+    Download a single file from Data Lake.
+    """
+    filesystem_client = service_client.get_file_system_client(DATA_LAKE_FILESYSTEM)
+    file_client = filesystem_client.get_file_client(remote_path)
     
-    # Ensure directory prefix ends with '/'
-    if directory_prefix and not directory_prefix.endswith('/'):
-        directory_prefix += '/'
+    # Create local directory if needed
+    local_dir = os.path.dirname(local_path)
+    if local_dir:
+        os.makedirs(local_dir, exist_ok=True)
     
-    # Create local download directory if it doesn't exist
-    os.makedirs(local_download_path, exist_ok=True)
+    # Download file
+    with open(local_path, 'wb') as f:
+        download = file_client.download_file()
+        f.write(download.readall())
+    
+    return local_path
+
+
+def download_directory(remote_directory: str, local_directory: str) -> list[str]:
+    """
+    Download all files from a Data Lake directory.
+    """
+    filesystem_client = service_client.get_file_system_client(DATA_LAKE_FILESYSTEM)
+    paths = filesystem_client.get_paths(path=remote_directory, recursive=True)
     
     downloaded_files = []
     
-    # List and download all blobs with the specified prefix
-    blobs = container_client.list_blobs(name_starts_with=directory_prefix)
-    
-    for blob in blobs:
-        # Skip if it's just the directory marker
-        if blob.name.endswith('/'):
-            continue
-        
-        # Calculate relative path and local file path
-        relative_path = blob.name[len(directory_prefix):] if directory_prefix else blob.name
-        local_file_path = os.path.join(local_download_path, relative_path)
-        
-        # Create subdirectories if needed
-        local_dir = os.path.dirname(local_file_path)
-        if local_dir:
-            os.makedirs(local_dir, exist_ok=True)
-        
-        # Download the blob
-        blob_client = container_client.get_blob_client(blob.name)
-        
-        with open(local_file_path, 'wb') as file:
-            download_stream = blob_client.download_blob()
-            file.write(download_stream.readall())
-        
-        downloaded_files.append(local_file_path)
-        print(f"Downloaded: {blob.name} -> {local_file_path}")
+    for path in paths:
+        if not path.is_directory:
+            # Calculate relative path
+            relative_path = path.name[len(remote_directory):].lstrip('/')
+            local_file_path = os.path.join(local_directory, relative_path)
+            
+            # Download
+            download_file(path.name, local_file_path)
+            downloaded_files.append(local_file_path)
+            print(f"Downloaded: {path.name} -> {local_file_path}")
     
     return downloaded_files
 
 
-def list_blobs_in_directory(
-    account_url: str,
-    container_name: str,
-    sas_token: str,
-    directory_prefix: str = ""
-) -> list[dict]:
+# If you need to use SAS token instead of DefaultAzureCredential
+def get_client_with_sas(account_name: str, sas_token: str):
     """
-    List all blobs in a virtual directory without downloading.
-    
-    Returns:
-        List of dictionaries containing blob metadata
+    Create client using SAS token instead of DefaultAzureCredential.
     """
     if not sas_token.startswith('?'):
         sas_token = '?' + sas_token
     
-    container_url = f"{account_url}/{container_name}{sas_token}"
-    container_client = ContainerClient.from_container_url(container_url)
-    
-    if directory_prefix and not directory_prefix.endswith('/'):
-        directory_prefix += '/'
-    
-    blob_list = []
-    blobs = container_client.list_blobs(name_starts_with=directory_prefix)
-    
-    for blob in blobs:
-        if not blob.name.endswith('/'):
-            blob_list.append({
-                'name': blob.name,
-                'size': blob.size,
-                'last_modified': blob.last_modified,
-                'content_type': blob.content_settings.content_type if blob.content_settings else None
-            })
-    
-    return blob_list
+    account_url = f"https://{account_name}.dfs.core.windows.net{sas_token}"
+    return DataLakeServiceClient(account_url=account_url)
 
 
 # Example usage
 if __name__ == "__main__":
-    # Configuration - replace with your values
-    ACCOUNT_URL = "https://yourstorageaccount.blob.core.windows.net"
-    CONTAINER_NAME = "your-container"
-    SAS_TOKEN = "sv=2022-11-02&ss=b&srt=co&sp=rl&se=2025-12-31T23:59:59Z&st=2025-01-01T00:00:00Z&spr=https&sig=your_signature_here"
-    DIRECTORY_PREFIX = "data/input/"  # Virtual directory path
-    LOCAL_PATH = "./downloaded_data"
+    # List files in a directory
+    files = list_directory("your/directory/path")
+    for f in files:
+        print(f"{f['name']} - {'DIR' if f['is_directory'] else f['size']} bytes")
     
-    # List blobs first
-    print("Listing blobs in directory...")
-    blobs = list_blobs_in_directory(
-        account_url=ACCOUNT_URL,
-        container_name=CONTAINER_NAME,
-        sas_token=SAS_TOKEN,
-        directory_prefix=DIRECTORY_PREFIX
+    # Download entire directory
+    downloaded = download_directory(
+        remote_directory="your/source/directory",
+        local_directory="./downloaded_data"
     )
-    
-    for blob in blobs:
-        print(f"  {blob['name']} ({blob['size']} bytes)")
-    
-    print(f"\nFound {len(blobs)} blobs")
-    
-    # Download all blobs
-    print("\nDownloading blobs...")
-    downloaded = download_blobs_from_directory(
-        account_url=ACCOUNT_URL,
-        container_name=CONTAINER_NAME,
-        sas_token=SAS_TOKEN,
-        directory_prefix=DIRECTORY_PREFIX,
-        local_download_path=LOCAL_PATH
-    )
-    
-    print(f"\nDownloaded {len(downloaded)} files")
+    print(f"Downloaded {len(downloaded)} files")
