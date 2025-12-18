@@ -1,13 +1,10 @@
-from azure.identity import ClientSecretCredential
 from azure.storage.filedatalake import DataLakeServiceClient
 import os
 
 # =============================================================================
 # CONFIGURATION - Fill in your values here
 # =============================================================================
-TENANT_ID = "your-tenant-id-here"
-CLIENT_ID = "your-client-id-here"
-CLIENT_SECRET = "your-client-secret-here"
+SAS_TOKEN = "your-sas-token-here"  # Paste your SAS token here
 
 DATA_LAKE_ACCOUNT = "redprdprivatelake"
 DATA_LAKE_FILESYSTEM = "red"
@@ -15,15 +12,12 @@ DATA_LAKE_FILESYSTEM = "red"
 # =============================================================================
 # CREATE CONNECTION
 # =============================================================================
-credential = ClientSecretCredential(
-    tenant_id=TENANT_ID,
-    client_id=CLIENT_ID,
-    client_secret=CLIENT_SECRET
-)
+# Remove leading '?' if present, then add it
+if SAS_TOKEN.startswith('?'):
+    SAS_TOKEN = SAS_TOKEN[1:]
 
 service_client = DataLakeServiceClient(
-    account_url=f"https://{DATA_LAKE_ACCOUNT}.dfs.core.windows.net",
-    credential=credential
+    account_url=f"https://{DATA_LAKE_ACCOUNT}.dfs.core.windows.net?{SAS_TOKEN}"
 )
 
 # =============================================================================
@@ -55,12 +49,10 @@ def download_file(remote_path, local_path):
     filesystem_client = service_client.get_file_system_client(DATA_LAKE_FILESYSTEM)
     file_client = filesystem_client.get_file_client(remote_path)
     
-    # Create local directory if needed
     local_dir = os.path.dirname(local_path)
     if local_dir:
         os.makedirs(local_dir, exist_ok=True)
     
-    # Download file
     with open(local_path, 'wb') as f:
         download = file_client.download_file()
         f.write(download.readall())
@@ -81,15 +73,12 @@ def download_directory(remote_directory, local_directory):
     downloaded_files = []
     for path in paths:
         if not path.is_directory:
-            # Calculate relative path
             if remote_directory:
                 relative_path = path.name[len(remote_directory):].lstrip('/')
             else:
                 relative_path = path.name
             
             local_file_path = os.path.join(local_directory, relative_path)
-            
-            # Download the file
             download_file(path.name, local_file_path)
             downloaded_files.append(local_file_path)
     
@@ -97,11 +86,11 @@ def download_directory(remote_directory, local_directory):
 
 
 # =============================================================================
-# MAIN - Example usage
+# MAIN
 # =============================================================================
 if __name__ == "__main__":
     
-    # Example 1: List files in root directory
+    # List files in root
     print("Listing files in root:")
     print("-" * 50)
     files = list_directory("")
@@ -109,23 +98,8 @@ if __name__ == "__main__":
         file_type = "DIR" if f['is_directory'] else "FILE"
         print(f"[{file_type}] {f['name']}")
     
-    print()
+    # Download a single file
+    # download_file("path/to/file.csv", "C:/Users/cw014536_emea/Desktop/dlqke/file.csv")
     
-    # Example 2: List files in a specific folder
-    # print("Listing files in 'your/folder/path':")
-    # print("-" * 50)
-    # files = list_directory("your/folder/path")
-    # for f in files:
-    #     print(f['name'])
-    
-    # Example 3: Download a single file
-    # download_file(
-    #     remote_path="path/to/remote/file.csv",
-    #     local_path="C:/Users/cw014536_emea/Desktop/dlqke/file.csv"
-    # )
-    
-    # Example 4: Download entire directory
-    # download_directory(
-    #     remote_directory="path/to/remote/folder",
-    #     local_directory="C:/Users/cw014536_emea/Desktop/dlqke/downloaded"
-    # )
+    # Download entire directory
+    # download_directory("folder/path", "C:/Users/cw014536_emea/Desktop/dlqke/downloaded")
