@@ -2,9 +2,9 @@ from azure.storage.filedatalake import DataLakeServiceClient
 import os
 
 # =============================================================================
-# CONFIGURATION - Fill in your values here
+# CONFIGURATION
 # =============================================================================
-SAS_TOKEN = "your-sas-token-here"  # Paste your SAS token here
+SAS_TOKEN = "paste-your-sas-token-here"
 
 DATA_LAKE_ACCOUNT = "redprdprivatelake"
 DATA_LAKE_FILESYSTEM = "red"
@@ -12,7 +12,6 @@ DATA_LAKE_FILESYSTEM = "red"
 # =============================================================================
 # CREATE CONNECTION
 # =============================================================================
-# Remove leading '?' if present, then add it
 if SAS_TOKEN.startswith('?'):
     SAS_TOKEN = SAS_TOKEN[1:]
 
@@ -25,9 +24,6 @@ service_client = DataLakeServiceClient(
 # =============================================================================
 
 def list_directory(directory_path=""):
-    """
-    List all files and folders in a directory.
-    """
     filesystem_client = service_client.get_file_system_client(DATA_LAKE_FILESYSTEM)
     paths = filesystem_client.get_paths(path=directory_path)
     
@@ -43,9 +39,6 @@ def list_directory(directory_path=""):
 
 
 def download_file(remote_path, local_path):
-    """
-    Download a single file from Data Lake.
-    """
     filesystem_client = service_client.get_file_system_client(DATA_LAKE_FILESYSTEM)
     file_client = filesystem_client.get_file_client(remote_path)
     
@@ -62,9 +55,6 @@ def download_file(remote_path, local_path):
 
 
 def download_directory(remote_directory, local_directory):
-    """
-    Download all files from a Data Lake directory.
-    """
     filesystem_client = service_client.get_file_system_client(DATA_LAKE_FILESYSTEM)
     paths = filesystem_client.get_paths(path=remote_directory, recursive=True)
     
@@ -86,20 +76,17 @@ def download_directory(remote_directory, local_directory):
 
 
 # =============================================================================
-# MAIN
+# MAIN - Use "adhoc" folder since SAS is generated for that
 # =============================================================================
 if __name__ == "__main__":
     
-    # List files in root
-    print("Listing files in root:")
+    # List files in adhoc folder
+    print("Listing files in adhoc:")
     print("-" * 50)
-    files = list_directory("")
+    files = list_directory("adhoc")
     for f in files:
         file_type = "DIR" if f['is_directory'] else "FILE"
         print(f"[{file_type}] {f['name']}")
     
-    # Download a single file
-    # download_file("path/to/file.csv", "C:/Users/cw014536_emea/Desktop/dlqke/file.csv")
-    
-    # Download entire directory
-    # download_directory("folder/path", "C:/Users/cw014536_emea/Desktop/dlqke/downloaded")
+    # Download entire adhoc folder
+    # download_directory("adhoc", "C:/Users/cw014536_emea/Desktop/dlqke/adhoc_download")
