@@ -1,22 +1,38 @@
-from azure.identity import DefaultAzureCredential
+from azure.identity import ClientSecretCredential
 from azure.storage.filedatalake import DataLakeServiceClient
 import os
 
-# Your existing setup
-DATA_LAKE_ACCOUNT = os.getenv('DATA_LAKE_ACCOUNT', 'redprdprivatelake')
-DATA_LAKE_FILESYSTEM = os.getenv('DATA_LAKE_FILESYSTEM', 'regression')
+# =============================================================================
+# CONFIGURATION - Fill in your values here
+# =============================================================================
+TENANT_ID = "your-tenant-id-here"
+CLIENT_ID = "your-client-id-here"
+CLIENT_SECRET = "your-client-secret-here"
 
-# Using DefaultAzureCredential (same as your existing code)
-credential = DefaultAzureCredential()
+DATA_LAKE_ACCOUNT = "redprdprivatelake"
+DATA_LAKE_FILESYSTEM = "red"
+
+# =============================================================================
+# CREATE CONNECTION
+# =============================================================================
+credential = ClientSecretCredential(
+    tenant_id=TENANT_ID,
+    client_id=CLIENT_ID,
+    client_secret=CLIENT_SECRET
+)
+
 service_client = DataLakeServiceClient(
-    f"https://{DATA_LAKE_ACCOUNT}.dfs.core.windows.net",
+    account_url=f"https://{DATA_LAKE_ACCOUNT}.dfs.core.windows.net",
     credential=credential
 )
 
+# =============================================================================
+# FUNCTIONS
+# =============================================================================
 
-def list_directory(directory_path: str = "") -> list[dict]:
+def list_directory(directory_path=""):
     """
-    List all files in a directory.
+    List all files and folders in a directory.
     """
     filesystem_client = service_client.get_file_system_client(DATA_LAKE_FILESYSTEM)
     paths = filesystem_client.get_paths(path=directory_path)
@@ -32,7 +48,7 @@ def list_directory(directory_path: str = "") -> list[dict]:
     return file_list
 
 
-def download_file(remote_path: str, local_path: str) -> str:
+def download_file(remote_path, local_path):
     """
     Download a single file from Data Lake.
     """
@@ -49,54 +65,67 @@ def download_file(remote_path: str, local_path: str) -> str:
         download = file_client.download_file()
         f.write(download.readall())
     
+    print(f"Downloaded: {remote_path} -> {local_path}")
     return local_path
 
 
-def download_directory(remote_directory: str, local_directory: str) -> list[str]:
+def download_directory(remote_directory, local_directory):
     """
     Download all files from a Data Lake directory.
     """
     filesystem_client = service_client.get_file_system_client(DATA_LAKE_FILESYSTEM)
     paths = filesystem_client.get_paths(path=remote_directory, recursive=True)
     
-    downloaded_files = []
+    os.makedirs(local_directory, exist_ok=True)
     
+    downloaded_files = []
     for path in paths:
         if not path.is_directory:
             # Calculate relative path
-            relative_path = path.name[len(remote_directory):].lstrip('/')
+            if remote_directory:
+                relative_path = path.name[len(remote_directory):].lstrip('/')
+            else:
+                relative_path = path.name
+            
             local_file_path = os.path.join(local_directory, relative_path)
             
-            # Download
+            # Download the file
             download_file(path.name, local_file_path)
             downloaded_files.append(local_file_path)
-            print(f"Downloaded: {path.name} -> {local_file_path}")
     
     return downloaded_files
 
 
-# If you need to use SAS token instead of DefaultAzureCredential
-def get_client_with_sas(account_name: str, sas_token: str):
-    """
-    Create client using SAS token instead of DefaultAzureCredential.
-    """
-    if not sas_token.startswith('?'):
-        sas_token = '?' + sas_token
-    
-    account_url = f"https://{account_name}.dfs.core.windows.net{sas_token}"
-    return DataLakeServiceClient(account_url=account_url)
-
-
-# Example usage
+# =============================================================================
+# MAIN - Example usage
+# =============================================================================
 if __name__ == "__main__":
-    # List files in a directory
-    files = list_directory("your/directory/path")
-    for f in files:
-        print(f"{f['name']} - {'DIR' if f['is_directory'] else f['size']} bytes")
     
-    # Download entire directory
-    downloaded = download_directory(
-        remote_directory="your/source/directory",
-        local_directory="./downloaded_data"
-    )
-    print(f"Downloaded {len(downloaded)} files")
+    # Example 1: List files in root directory
+    print("Listing files in root:")
+    print("-" * 50)
+    files = list_directory("")
+    for f in files:
+        file_type = "DIR" if f['is_directory'] else "FILE"
+        print(f"[{file_type}] {f['name']}")
+    
+    print()
+    
+    # Example 2: List files in a specific folder
+    # print("Listing files in 'your/folder/path':")
+    # print("-" * 50)
+    # files = list_directory("your/folder/path")
+    # for f in files:
+    #     print(f['name'])
+    
+    # Example 3: Download a single file
+    # download_file(
+    #     remote_path="path/to/remote/file.csv",
+    #     local_path="C:/Users/cw014536_emea/Desktop/dlqke/file.csv"
+    # )
+    
+    # Example 4: Download entire directory
+    # download_directory(
+    #     remote_directory="path/to/remote/folder",
+    #     local_directory="C:/Users/cw014536_emea/Desktop/dlqke/downloaded"
+    # )
