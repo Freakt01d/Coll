@@ -35,81 +35,45 @@ steps:
       tool-version: "0.1.7"
 
   - name: Azure login and config setup
-    shell: bash
     run: |
-      set -euo pipefail
-      az login --service-principal \
-        -u "${{ secrets.AZURE_CLIENT_ID_DEV }}" \
-        -p "${{ secrets.AZURE_CLIENT_SECRET_DEV }}" \
-        -t "${{ secrets.AZURE_TENANT_ID }}"
-      az account set -s "${{ secrets.AZURE_SUBSCRIPTION_ID_DEV }}"
-      az aks get-credentials \
-        --name "gbto-red-dev-we-${{ vars.ACTIVE_AKS_TYPE_DEV }}-aks" \
-        --resource-group "gbto-red-dev-we-${{ vars.ACTIVE_AKS_TYPE_DEV }}-aks" \
-        --overwrite-existing \
-        --subscription "gbis-gbsu-reg-rgi-red-1-dev"
+      az login --service-principal -u ${{ secrets.AZURE_CLIENT_ID_DEV }} -p ${{ secrets.AZURE_CLIENT_SECRET_DEV }} -t ${{ secrets.AZURE_TENANT_ID }}
+      az account set -s ${{ secrets.AZURE_SUBSCRIPTION_ID_DEV }}
+      az aks get-credentials --name gbto-red-dev-we-${{ vars.ACTIVE_AKS_TYPE_DEV }}-aks --resource-group gbto-red-dev-we-${{ vars.ACTIVE_AKS_TYPE_DEV }}-aks --overwrite-existing --subscription gbis-gbsu-reg-rgi-red-1-dev
       kubelogin convert-kubeconfig -l azurecli
-      # Rewrite host and inject corporate CA bundle into kubeconfig
       sed -i 's/hcp/portal.hcp/g' /home/runner/.kube/config
       yq -e ".clusters[0].cluster.certificate-authority-data = \"$(cat $HOME/certs/cacerts.crt | base64 -w 0)\"" -i /home/runner/.kube/config
+      cat /home/runner/.kube/config
       export KUBECONFIG=/home/runner/.kube/config
-      echo "KUBECONFIG=/home/runner/.kube/config" >> $GITHUB_ENV
 
-  - name: Verify access
+  - name: Running kubectl
     run: kubectl get ns
 
-  - name: Checkout manifests repo (dart-parquet-api-poc)
+  - name: Checkout Repo
     uses: actions/checkout@v3
     with:
-      repository: RED/dart-parquet-api-poc   # <- Repo that contains k8s/deployment.yaml
-      ref: main                               # <- Adjust if your manifest is on another branch
+      repository: RED/dart-parquet-api-poc
+      ref: main
       token: ${{ secrets.GIT_TOKEN }}
 
-  - name: Template image tag into manifest
-    shell: bash
+  - name: Setup Deployment Yml Image version
     run: |
-      set -euo pipefail
-      MANIFEST_PATH="k8s/deployment.yaml"
-      OUT_PATH="Kube/app-deployment.yaml"
-
-      echo "=== Repo root ==="
-      ls -al || true
-      echo "=== k8s folder ==="
-      ls -al k8s || true
-      echo "==================="
-
-      if [ ! -f "$MANIFEST_PATH" ]; then
-        echo "Manifest not found at $MANIFEST_PATH"
-        exit 1
-      fi
-
       mkdir -p Kube
-      sed "s/{{IMAGE_TAG}}/${{ github.event.inputs.version }}/g" "$MANIFEST_PATH" > "$OUT_PATH"
+      echo "Version to deploy: ${{ github.event.inputs.version }}"
+      cat k8s/deployment.yaml | sed 's/{{IMAGE_TAG}}/${{ github.event.inputs.version }}/g' > Kube/app-deployment.yml
+      ls -al
+      ls -al Kube
+      pwd
 
-      echo "Templated manifest (first 40 lines):"
-      head -n 40 "$OUT_PATH" || true
-
-  - name: Deploy to AKS
-    shell: bash
-    env:
-      KUBECONFIG: /home/runner/.kube/config
+  - name: Setup Kube and Deploy
     run: |
-      set -euo pipefail
-      kubectl apply -f Kube/app-deployment.yaml -n red-dev --validate=false
-      echo "Waiting for rollout..."
-      kubectl rollout status deploy/parquet-audit-api -n red-dev --timeout=6m
-
-  # Optional: better diagnostics if rollout fails
-  - name: Show troubleshooting info on failure
-    if: ${{ failure() }}
-    shell: bash
-    env:
-      KUBECONFIG: /home/runner/.kube/config
-    run: |
-      echo "==== DESCRIBE DEPLOYMENT ===="
-      kubectl describe deploy/parquet-audit-api -n red-dev || true
-      echo "==== PODS ===="
-      kubectl get pods -n red-dev -o wide || true
-      echo "==== EVENTS ===="
-      kubectl get events -n red-dev --sort-by=.lastTimestamp | tail -n 50 || true
+      echo "KUBECONFIG=/home/runner/.kube/config" >> $GITHUB_ENV
+      echo "----------------------------"
+      export KUBECONFIG=/home/runner/.kube/config
+      echo "----------------------------"
+      ls -al
+      pwd
+      kubectl get pods -n red-dev
+      echo "----------------------------"
+      echo "deploying"
+      kubectl apply -f Kube/app-deployment.yml -n red-dev --validate=false
 ```
