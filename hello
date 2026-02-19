@@ -1,34 +1,136 @@
-from azure.storage.blob import ContainerClient
-import os
+name: azure-dart-parquet-api-poc-dev-build
 
-# =============================================================================
-# CONFIGURATION
-# =============================================================================
-# Paste your full Blob SAS URL here
-BLOB_SAS_URL = ""
+on:
+push:
+branches: [ “main” ]
+workflow_dispatch:
+inputs:
+version:
+description: “Build Version”
+required: true
+default: “uat_yy.mm.dd.1”
 
-# =============================================================================
-# CREATE CONNECTION
-# =============================================================================
-container_client = ContainerClient.from_container_url(BLOB_SAS_URL)
+env:
+sonarscanner-version: ‘set_me’
 
-# =============================================================================
-# MAIN
-# =============================================================================
-if __name__ == "__main__":
-    
-    print("Listing files:")
-    print("-" * 50)
-    
-    # Try without any prefix since SAS is already scoped to adhoc
-    try:
-        blobs = container_client.list_blobs()
-        count = 0
-        for blob in blobs:
-            print(f"{blob.name} - {blob.size} bytes")
-            count += 1
-        
-        if count == 0:
-            print("No files found")
-    except Exception as e:
-        print(f"Error: {e}")
+jobs:
+build:
+runs-on: [ self-hosted, linux ]
+
+```
+strategy:
+  matrix:
+    dotnet-version: [ '5.0.408' ]
+
+steps:
+  - name: Checkout Repo
+    uses: actions/checkout@v3
+    with:
+      repository: RED/dart-parquet-api-poc
+      ref: main
+      token: ${{ secrets.GIT_TOKEN }}
+
+  - name: Setup .NET SDK ${{ matrix.dotnet-version }}
+    uses: SGitHubActions/setup-dotnet@stable
+    with:
+      dotnet-version: '${{ matrix.dotnet-version }}'
+
+  - name: Show dotnet info
+    run: dotnet --info
+
+  - name: Clear NuGet cache
+    run: dotnet nuget locals all --clear
+
+  - name: Configure DSP NuGet source
+    shell: bash
+    env:
+      JFROG_TOKEN: ${{ secrets.JFROG_TOKEN }}
+    run: |
+      set -euo pipefail
+      dotnet nuget remove source nuget.org || true
+      dotnet nuget remove source Artifactory || true
+      dotnet nuget remove source ArtifactorySymbols || true
+      dotnet nuget remove source dsp1 || true
+      dotnet nuget remove source dsp2 || true
+      dotnet nuget remove source dsp3 || true
+      dotnet nuget remove source dsp-artifacts || true
+
+      dotnet nuget add source \
+        "https://dsp-artifacts.fr.world.socgen/artifactory/api/nuget/nuget-virtual-19150f0c-368d-4537-9952-77c02c0983e2" \
+        --name "dsp-artifacts" \
+        --username "usr-19150f0c-368d-4537-9952-77c02c0983e2" \
+        --password "$JFROG_TOKEN" \
+        --store-password-in-clear-text
+
+      dotnet nuget list source
+
+  - name: Restore dependencies
+    run: dotnet restore ParquetAuditApi.csproj -v minimal
+
+  - name: Build and Publish (linux-x64)
+    shell: bash
+    run: |
+      set -euo pipefail
+      dotnet build "ParquetAuditApi.csproj" -c Release --no-restore
+      rm -rf publish
+      dotnet publish "ParquetAuditApi.csproj" \
+        -c Release \
+        -r linux-x64 \
+        -o ./publish \
+        --self-contained false \
+        --no-restore
+      ls -la publish
+
+  - name: Prepare Dockerfile
+    shell: bash
+    run: |
+      set -euo pipefail
+      if [ -f Dockerfile ]; then
+        cp Dockerfile publish/Dockerfile
+      elif [ -f ./publish/Dockerfile ]; then
+        echo "Dockerfile already present in publish/"
+      else
+        echo "::error::Dockerfile not found at repo root or publish/Dockerfile."
+        exit 1
+      fi
+      ls -la publish
+
+  - name: Compute image tag
+    id: tag
+    shell: bash
+    run: |
+      set -euo pipefail
+      if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ github.event.inputs.version }}" ]; then
+        RAW_TAG="${{ github.event.inputs.version }}"
+      else
+        RAW_TAG="$(echo "$GITHUB_SHA" | cut -c1-7)"
+      fi
+      if [ -z "$RAW_TAG" ]; then
+        RAW_TAG="$(date +%y.%m.%d)"
+      fi
+      CLEAN_TAG="$(printf '%s' "$RAW_TAG" | tr -d '\r\n ' | sed 's/[^A-Za-z0-9._-]/-/g')"
+      if [ -z "$CLEAN_TAG" ]; then
+        CLEAN_TAG="default-tag"
+      fi
+      echo "TAG=$CLEAN_TAG" >> "$GITHUB_OUTPUT"
+      echo "Final Docker Tag: $CLEAN_TAG"
+
+  - name: Push docker image
+    uses: SGitHubActions/build-push-action@stable
+    with:
+      registry: "registry.gbis.azure-socgen.com/red"
+      dockerfile-path: publish/Dockerfile
+      tags: parquet-audit-api:${{ steps.tag.outputs.TAG }}
+    env:
+      DOCKER_USER: robot-red-cicd
+      DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+
+  - name: Publish tag as artifact for deploy
+    uses: actions/upload-artifact@v3
+    with:
+      name: built-tag
+      path: |
+        /dev/null
+      if-no-files-found: ignore
+    # Note: we'll pass the tag to deploy via input; this artifact is just optional bookkeeping
+```
