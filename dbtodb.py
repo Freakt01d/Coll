@@ -8,3 +8,5 @@
 
 "C:\Program Files\Java\jdk-25\bin\keytool" -list -keystore "C:\Program Files\Java\jdk-25\lib\security\cacerts" -storepass changeit -alias sg-root-ca
 
+"C:\Program Files\Java\jdk-25\bin\java.exe" -Djavax.net.ssl.trustStore="C:\Program Files\Java\jdk-25\lib\security\cacerts" -Djavax.net.ssl.trustStorePassword=changeit -jar agent.jar -jnlpUrl https://cdp-jenkins-paas-rxd-94585.fr.world.socgen/computer/VP1DRXD000DEV1/jenkins-agent.jnlp -secret <your_secret>
+
