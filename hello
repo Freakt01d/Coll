@@ -54,14 +54,7 @@ steps:
       dotnet nuget remove source dsp2 || true
       dotnet nuget remove source dsp3 || true
       dotnet nuget remove source dsp-artifacts || true
-
-      dotnet nuget add source \
-        "https://dsp-artifacts.fr.world.socgen/artifactory/api/nuget/nuget-virtual-19150f0c-368d-4537-9952-77c02c0983e2" \
-        --name "dsp-artifacts" \
-        --username "usr-19150f0c-368d-4537-9952-77c02c0983e2" \
-        --password "$JFROG_TOKEN" \
-        --store-password-in-clear-text
-
+      dotnet nuget add source "https://dsp-artifacts.fr.world.socgen/artifactory/api/nuget/nuget-virtual-19150f0c-368d-4537-9952-77c02c0983e2" --name "dsp-artifacts" --username "usr-19150f0c-368d-4537-9952-77c02c0983e2" --password "$JFROG_TOKEN" --store-password-in-clear-text
       dotnet nuget list source
 
   - name: Restore dependencies
@@ -73,12 +66,7 @@ steps:
       set -euo pipefail
       dotnet build "ParquetAuditApi.csproj" -c Release --no-restore
       rm -rf publish
-      dotnet publish "ParquetAuditApi.csproj" \
-        -c Release \
-        -r linux-x64 \
-        -o ./publish \
-        --self-contained false \
-        --no-restore
+      dotnet publish "ParquetAuditApi.csproj" -c Release -r linux-x64 -o ./publish --self-contained false --no-restore
       ls -la publish
 
   - name: Prepare Dockerfile
@@ -124,13 +112,4 @@ steps:
     env:
       DOCKER_USER: robot-red-cicd
       DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
-
-  - name: Publish tag as artifact for deploy
-    uses: actions/upload-artifact@v3
-    with:
-      name: built-tag
-      path: |
-        /dev/null
-      if-no-files-found: ignore
-    # Note: we'll pass the tag to deploy via input; this artifact is just optional bookkeeping
 ```
