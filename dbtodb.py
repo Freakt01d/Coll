@@ -1,14 +1,3 @@
-public class RegTaxSearchResponse
-{
-    [JsonProperty("bdrId")]
-    public string BdrId { get; set; }
+"C:\Program Files\Java\jdk-25\bin\keytool" -import -alias sg-root-ca -keystore "C:\Program Files\Java\jdk-25\lib\security\cacerts" -file "SG UniPass Root CA 2016.cer" -storepass changeit
 
-    [JsonProperty("sftrData")]
-    public List<SftrData> SftrData { get; set; }
-}
-
-public class SftrData
-{
-    [JsonProperty("category")]
-    public string Category { get; set; }
-}
+"C:\Program Files\Java\jdk-25\bin\keytool" -import -alias sg-intermediate-ca -keystore "C:\Program Files\Java\jdk-25\lib\security\cacerts" -file "SG-SubCA-SSLForwardProxy-GTS-SGGSC-PRD.cer" -storepass changeit
