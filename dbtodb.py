@@ -5,3 +5,6 @@
 
 
 "C:\Program Files\Common Files\Oracle\Java\javapath\java.exe" -XshowSettings:properties -version 2>&1 | findstr "java.home"
+
+"C:\Program Files\Java\jdk-25\bin\keytool" -list -keystore "C:\Program Files\Java\jdk-25\lib\security\cacerts" -storepass changeit -alias sg-root-ca
+
