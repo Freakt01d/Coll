@@ -1,256 +1,128 @@
-"""
-Compare partition row counts between source and destination tables
-- Compares by REF_DATE
-- Shows mismatches and missing partitions
-"""
+# ==========================================
 
-import sys
-import oracledb
-from datetime import datetime
+# Namespace
 
-# Database connection details - SOURCE
-SOURCE_SCHEMA = "SOURCE_SCHEMA"
-SOURCE_TABLE = "SOURCE_TABLE"
-SOURCE_USER = "YOUR_USER"
-SOURCE_PASSWORD = "YOUR_PASSWORD"
-SOURCE_HOST = "source_host.ocp.cloud.example.com"
-SOURCE_PORT = "1522"
-SOURCE_SID = "SOURCE_SID"
+# ==========================================
 
-# Database connection details - DESTINATION
-DEST_SCHEMA = "ABC$OWNER"
-DEST_TABLE = "EDS_IDX_COMP_ITEM"
-DEST_USER = "YOUR_USER"
-DEST_PASSWORD = "YOUR_PASSWORD"
-DEST_HOST = "dest_host.ocp.cloud.example.com"
-DEST_PORT = "1522"
-DEST_SID = "DEST_SID"
+## apiVersion: v1
+kind: Namespace
+metadata:
+name: red-dev
+labels:
+app: parquet-audit-api
 
-# Oracle Instant Client path
-ORACLE_CLIENT_PATH = r"D:\Homeware\instantclient_23_0"
+# ==========================================
 
-# Set to True if source and dest are same database
-SAME_DATABASE = True
+# Deployment (no TLS mounts, API handles HTTP only)
 
-def init_oracle_client():
-    try:
-        oracledb.init_oracle_client(lib_dir=ORACLE_CLIENT_PATH)
-        print("Oracle thick mode initialized")
-    except oracledb.ProgrammingError:
-        pass
-    except Exception as e:
-        print(f"ERROR: {e}")
-        sys.exit(1)
+# ==========================================
 
-def get_source_connection():
-    dsn = oracledb.makedsn(SOURCE_HOST, SOURCE_PORT, sid=SOURCE_SID)
-    return oracledb.connect(f"{SOURCE_USER}/{SOURCE_PASSWORD}@{dsn}")
+## apiVersion: apps/v1
+kind: Deployment
+metadata:
+name: parquet-audit-api
+namespace: red-dev
+labels:
+app: parquet-audit-api
+spec:
+replicas: 1
+selector:
+matchLabels:
+app: parquet-audit-api
+template:
+metadata:
+labels:
+app: parquet-audit-api
+spec:
+nodeSelector:
+kubernetes.io/os: linux
+containers:
+- name: api
+image: registry.gbis.azure-socgen.com/red/parquet-audit-api:{{IMAGE_TAG}}
+imagePullPolicy: Always
+ports:
+- name: http
+containerPort: 8080
+env:
+- name: ASPNETCORE_URLS
+value: http://0.0.0.0:8080
+# Probe targets: consider switching to a /health endpoint later
+startupProbe:
+httpGet:
+path: /swagger/index.html
+port: http
+initialDelaySeconds: 5
+periodSeconds: 5
+failureThreshold: 30    # ~150s max startup, adjust if needed
+livenessProbe:
+httpGet:
+path: /swagger/index.html
+port: http
+initialDelaySeconds: 20
+periodSeconds: 20
+timeoutSeconds: 3
+failureThreshold: 3
+resources:
+requests:
+cpu: “100m”
+memory: “256Mi”
+limits:
+cpu: “500m”
+memory: “1Gi”
+imagePullSecrets:
+- name: harbor
 
-def get_dest_connection():
-    if SAME_DATABASE:
-        return get_source_connection()
-    dsn = oracledb.makedsn(DEST_HOST, DEST_PORT, sid=DEST_SID)
-    return oracledb.connect(f"{DEST_USER}/{DEST_PASSWORD}@{dsn}")
+# ==========================================
 
-def get_partition_counts(conn, schema, table_name):
-    """Get row counts grouped by REF_DATE"""
-    cursor = conn.cursor()
-    
-    cursor.execute(f"""
-        SELECT REF_DATE, COUNT(*) AS cnt
-        FROM {schema}.{table_name}
-        GROUP BY REF_DATE
-        ORDER BY REF_DATE
-    """)
-    
-    counts = {}
-    for row in cursor.fetchall():
-        ref_date = row[0]
-        count = row[1]
-        # Convert to string for consistent comparison
-        if isinstance(ref_date, datetime):
-            ref_date = ref_date.strftime('%Y-%m-%d')
-        counts[ref_date] = count
-    
-    cursor.close()
-    return counts
+# Service
 
-def compare_partitions(source_counts, dest_counts):
-    """Compare source and destination counts"""
-    all_dates = set(source_counts.keys()) | set(dest_counts.keys())
-    
-    results = {
-        'match': [],
-        'mismatch': [],
-        'missing_in_dest': [],
-        'extra_in_dest': []
-    }
-    
-    for ref_date in sorted(all_dates):
-        src_cnt = source_counts.get(ref_date, 0)
-        dst_cnt = dest_counts.get(ref_date, 0)
-        
-        if src_cnt == dst_cnt and src_cnt > 0:
-            results['match'].append({
-                'date': ref_date,
-                'count': src_cnt
-            })
-        elif src_cnt > 0 and dst_cnt == 0:
-            results['missing_in_dest'].append({
-                'date': ref_date,
-                'source_count': src_cnt
-            })
-        elif src_cnt == 0 and dst_cnt > 0:
-            results['extra_in_dest'].append({
-                'date': ref_date,
-                'dest_count': dst_cnt
-            })
-        else:
-            results['mismatch'].append({
-                'date': ref_date,
-                'source_count': src_cnt,
-                'dest_count': dst_cnt,
-                'diff': src_cnt - dst_cnt
-            })
-    
-    return results
+# ==========================================
 
-def print_results(results, source_counts, dest_counts):
-    """Print comparison results"""
-    print("\n" + "="*80)
-    print("PARTITION COMPARISON RESULTS")
-    print("="*80)
-    
-    print(f"\nSummary:")
-    print(f"  Source dates: {len(source_counts)}")
-    print(f"  Dest dates:   {len(dest_counts)}")
-    print(f"  Matching:     {len(results['match'])}")
-    print(f"  Mismatched:   {len(results['mismatch'])}")
-    print(f"  Missing:      {len(results['missing_in_dest'])}")
-    print(f"  Extra:        {len(results['extra_in_dest'])}")
-    
-    total_source = sum(source_counts.values())
-    total_dest = sum(dest_counts.values())
-    print(f"\n  Total source rows: {total_source:,}")
-    print(f"  Total dest rows:   {total_dest:,}")
-    print(f"  Difference:        {total_source - total_dest:,}")
-    
-    if results['mismatch']:
-        print(f"\n{'='*80}")
-        print("MISMATCHED PARTITIONS (different row counts)")
-        print("="*80)
-        print(f"{'REF_DATE':<15} {'SOURCE':>15} {'DEST':>15} {'DIFF':>15}")
-        print("-"*60)
-        for item in results['mismatch'][:50]:
-            print(f"{item['date']:<15} {item['source_count']:>15,} {item['dest_count']:>15,} {item['diff']:>15,}")
-        if len(results['mismatch']) > 50:
-            print(f"... and {len(results['mismatch']) - 50} more")
-    
-    if results['missing_in_dest']:
-        print(f"\n{'='*80}")
-        print("MISSING IN DESTINATION (exists in source only)")
-        print("="*80)
-        print(f"{'REF_DATE':<15} {'SOURCE COUNT':>15}")
-        print("-"*30)
-        for item in results['missing_in_dest'][:50]:
-            print(f"{item['date']:<15} {item['source_count']:>15,}")
-        if len(results['missing_in_dest']) > 50:
-            print(f"... and {len(results['missing_in_dest']) - 50} more")
-        
-        missing_total = sum(item['source_count'] for item in results['missing_in_dest'])
-        print(f"\nTotal missing rows: {missing_total:,}")
-    
-    if results['extra_in_dest']:
-        print(f"\n{'='*80}")
-        print("EXTRA IN DESTINATION (exists in dest only)")
-        print("="*80)
-        print(f"{'REF_DATE':<15} {'DEST COUNT':>15}")
-        print("-"*30)
-        for item in results['extra_in_dest'][:50]:
-            print(f"{item['date']:<15} {item['dest_count']:>15,}")
-        if len(results['extra_in_dest']) > 50:
-            print(f"... and {len(results['extra_in_dest']) - 50} more")
-    
-    print("\n" + "="*80)
+## apiVersion: v1
+kind: Service
+metadata:
+name: parquet-audit-api
+namespace: red-dev
+labels:
+app: parquet-audit-api
+spec:
+selector:
+app: parquet-audit-api
+ports:
+- protocol: TCP
+port: 80
+targetPort: http
+type: ClusterIP
 
-def export_to_csv(results, filename='partition_comparison.csv'):
-    """Export results to CSV"""
-    with open(filename, 'w') as f:
-        f.write("REF_DATE,SOURCE_COUNT,DEST_COUNT,DIFF,STATUS\n")
-        
-        for item in results['match']:
-            f.write(f"{item['date']},{item['count']},{item['count']},0,MATCH\n")
-        
-        for item in results['mismatch']:
-            f.write(f"{item['date']},{item['source_count']},{item['dest_count']},{item['diff']},MISMATCH\n")
-        
-        for item in results['missing_in_dest']:
-            f.write(f"{item['date']},{item['source_count']},0,{item['source_count']},MISSING_IN_DEST\n")
-        
-        for item in results['extra_in_dest']:
-            f.write(f"{item['date']},0,{item['dest_count']},{-item['dest_count']},EXTRA_IN_DEST\n")
-    
-    print(f"\nResults exported to: {filename}")
+# ==========================================
 
-def main():
-    print("="*60)
-    print("PARTITION COUNT COMPARISON")
-    print("="*60)
-    
-    init_oracle_client()
-    
-    # Get table names or use defaults
-    source_input = input(f"\nSource table [{SOURCE_SCHEMA}.{SOURCE_TABLE}]: ").strip()
-    if source_input:
-        if '.' in source_input:
-            src_schema, src_table = source_input.upper().split('.')
-        else:
-            src_schema = SOURCE_SCHEMA
-            src_table = source_input.upper()
-    else:
-        src_schema = SOURCE_SCHEMA
-        src_table = SOURCE_TABLE
-    
-    dest_input = input(f"Dest table [{DEST_SCHEMA}.{DEST_TABLE}]: ").strip()
-    if dest_input:
-        if '.' in dest_input:
-            dst_schema, dst_table = dest_input.upper().split('.')
-        else:
-            dst_schema = DEST_SCHEMA
-            dst_table = dest_input.upper()
-    else:
-        dst_schema = DEST_SCHEMA
-        dst_table = DEST_TABLE
-    
-    print(f"\nComparing:")
-    print(f"  Source: {src_schema}.{src_table}")
-    print(f"  Dest:   {dst_schema}.{dst_table}")
-    
-    # Get counts from source
-    print(f"\nFetching source counts...")
-    source_conn = get_source_connection()
-    source_counts = get_partition_counts(source_conn, src_schema, src_table)
-    source_conn.close()
-    print(f"  Found {len(source_counts)} dates in source")
-    
-    # Get counts from destination
-    print(f"Fetching destination counts...")
-    dest_conn = get_dest_connection()
-    dest_counts = get_partition_counts(dest_conn, dst_schema, dst_table)
-    dest_conn.close()
-    print(f"  Found {len(dest_counts)} dates in destination")
-    
-    # Compare
-    print(f"\nComparing partitions...")
-    results = compare_partitions(source_counts, dest_counts)
-    
-    # Print results
-    print_results(results, source_counts, dest_counts)
-    
-    # Export option
-    export = input("\nExport to CSV? (y/n): ").strip().lower()
-    if export == 'y':
-        export_to_csv(results)
+# Ingress
 
-if __name__ == "__main__":
-    main()
+# ==========================================
+
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+name: parquet-audit-api-ingress
+namespace: red-dev
+annotations:
+nginx.ingress.kubernetes.io/backend-protocol: “HTTP”
+nginx.ingress.kubernetes.io/ssl-redirect: “true”
+nginx.ingress.kubernetes.io/proxy-body-size: “50m”
+spec:
+ingressClassName: nginx
+tls:
+- hosts:
+- parquet-audit.red.dev.euw.gbis.sg-azure.com
+secretName: reddev-wild-tls
+rules:
+- host: parquet-audit.red.dev.euw.gbis.sg-azure.com
+http:
+paths:
+- path: /
+pathType: Prefix
+backend:
+service:
+name: parquet-audit-api
+port:
+number: 80
